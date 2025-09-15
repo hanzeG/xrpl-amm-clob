@@ -1,0 +1,18 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+
+# Conda / virtual environments
+.env
+.venv
+.conda
+*.egg-info/
+
+# VS Code project settings
+.vscode/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# OS-specific
+.DS_Store

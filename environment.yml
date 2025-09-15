@@ -1,0 +1,11 @@
+name: xrpl-amm-clob
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - matplotlib
+  - numpy
+  - pandas
+  - jupyterlab
+  - seaborn
+prefix: /opt/homebrew/anaconda3/envs/xrpl-amm-clob
