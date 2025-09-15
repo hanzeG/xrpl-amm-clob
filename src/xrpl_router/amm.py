@@ -48,7 +48,7 @@ class AMM:
 
     # --- Diagnostics ---
     def spq(self) -> Decimal:
-        """Small‑trade quality ≈ (y/x)*(1-fee), quantised to quality grid."""
+        """Small-trade quality ≈ (y/x)*(1-fee), quantised to quality grid."""
         if self.x <= 0 or self.y <= 0:
             return Decimal(0)
         return quantize_quality((self.y / self.x) * (Decimal(1) - self.fee))
@@ -79,6 +79,54 @@ class AMM:
         dx = dx_eff / (Decimal(1) - self.fee)
         # Ceil to input grid so we do not underfund the swap.
         return round_in_min(dx, is_xrp=self.x_is_xrp)
+
+    # --- Whitepaper-style synthetic quote (anchor to target quality) ---
+    def synthetic_segment_for_quality(self,
+                                      q_threshold: Decimal | str | float,
+                                      *,
+                                      max_out_cap: Decimal | str | float | None = None
+                                      ) -> Segment | None:
+        """Produce a single AMM slice whose average quality ~= q_threshold.
+
+        q_threshold is typically the LOB top-tier quality for the current iteration.
+        We solve for dy so that dy/dx ≈ q_threshold:
+            q_slice = (1 - fee) * (y - dy) / x  =>  dy_anchor = y - (q*x)/(1-fee)
+        Then floor dy to OUT grid, ceil dx to IN grid.
+        """
+        if self.x <= 0 or self.y <= 0:
+            return None
+        q = clamp_nonneg(to_decimal(q_threshold))
+        if q <= 0:
+            return None
+
+        one_minus_fee = (Decimal(1) - self.fee)
+        if one_minus_fee <= 0:
+            return None
+
+        # Theoretical dy that anchors average quality to q.
+        dy_theory = self.y - (q * self.x) / one_minus_fee
+
+        # Apply optional cap and floor to amount grid to avoid overpaying.
+        y_quant = XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM
+        if max_out_cap is not None:
+            cap = clamp_nonneg(to_decimal(max_out_cap))
+            if cap > 0 and dy_theory > cap:
+                dy_theory = cap
+
+        dy = round_out_max(dy_theory, is_xrp=self.y_is_xrp)
+        if dy <= 0 or dy >= self.y:
+            return None
+
+        # Compute required IN (ceil to grid inside).
+        dx = self.swap_in_given_out(dy)
+        if dx <= 0:
+            return None
+
+        q_slice = calc_quality(dy, dx)
+        if q_slice <= 0:
+            return None
+
+        return Segment(src="AMM", quality=q_slice, out_max=dy, in_at_out_max=dx)
 
     # --- Segmentation ---
     def segments_for_out(self,
