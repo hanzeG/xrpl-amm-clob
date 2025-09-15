@@ -1,105 +1,180 @@
-"""Minimal demo to show CLOB → Segment conversion and AMM anchoring, with optional limits."""
+"""Comprehensive demo: CLOB↔AMM routing under whitepaper semantics (anchoring, tiers, limits).
+
+Scenarios covered:
+A) Both sources, unconstrained (single-tier fill)
+B) Both sources, send_max + deliver_min (forward recompute under budget)
+C) CLOB strictly better than AMM (AMM contributes 0 in tier)
+D) AMM-only (no CLOB levels)
+E) Demand exceeds tier-1 capacity → multi-iteration (tier-1 then tier-2)
+F) Failure case: deliver_min cannot be met
+"""
+from __future__ import annotations
 
 from decimal import Decimal
+from typing import List, Optional, Callable
 
 from xrpl_router.clob import ClobLevel, Clob
 from xrpl_router.amm import AMM
 from xrpl_router.router import route, RouteError
 
 
-def print_segments(title, segs):
-    print(f"\n=== {title} ===")
-    for s in segs:
-        print(s)
-    print("Legend: quality=OUT/IN; out_max=max deliverable OUT; in_at_out_max=IN needed for out_max; in_is_xrp/out_is_xrp indicate amount grid.")
+# ---------- pretty printers ----------
+
+def brief_book(levels: List[ClobLevel]) -> str:
+    if not levels:
+        return "CLOB: (empty)"
+    parts = [f"CLOB[{i+1}]: price={lvl.price_in_per_out} IN/OUT, out_max={lvl.out_liquidity}" for i, lvl in enumerate(levels)]
+    return "; ".join(parts)
 
 
-def print_route_result(title, res):
+def print_result(title: str, filled_out: Decimal, spent_in: Decimal, avg_q: Decimal, trace):
     print(f"\n=== {title} ===")
-    print(f"Filled OUT: {res.filled_out}")
-    print(f"Spent IN:   {res.spent_in}")
-    print(f"Avg quality: {res.avg_quality}")
-    print("Steps:")
-    cum_out = Decimal("0")
-    cum_in = Decimal("0")
-    for i, step in enumerate(res.trace, 1):
-        so = step['take_out']
-        si = step['take_in']
+    print(f"Totals: OUT={filled_out}  IN={spent_in}  avg_q={avg_q}")
+    print("Steps (src | out | in | inst_q | tier_q):")
+    for s in trace:
+        so, si = s['take_out'], s['take_in']
         inst_q = (so / si) if si > 0 else Decimal("0")
-        cum_out += so
-        cum_in += si
-        print(f"  {i:02d}. {step['src']}: out={so} in={si} inst_q={inst_q} (tier_q={step['quality']}) | cum_out={cum_out} cum_in={cum_in}")
-    if res.usage:
-        print("Usage summary (OUT by source):", res.usage)
+        print(f"  {s['src']:>4} | {so} | {si} | {inst_q} | {s['quality']}")
 
 
-# -----------------------------
-# Build CLOB and AMM test data
-# -----------------------------
-levels = [
-    ClobLevel.from_numbers("1.0100", "60"),   # price=1.01 IN per OUT, 60 OUT available
-    ClobLevel.from_numbers("1.0200", "100"),  # price=1.02 IN per OUT, 100 OUT available
-]
-book = Clob(levels, in_is_xrp=False, out_is_xrp=False)
-segs = book.segments()
-print_segments("CLOB segments", segs)
+# ---------- scenario runner ----------
 
-amm = AMM(
-    x_reserve="10000",  # IN side reserve (X)
-    y_reserve="10150",  # OUT side reserve (Y)
-    fee="0.003",        # 0.3% input-side fee
-    x_is_xrp=False,
-    y_is_xrp=False,
-)
-print("\n=== AMM initial state ===")
-print(f"Reserves: X={amm.x} Y={amm.y}")
-print(f"SPQ:      {amm.spq()}")
+def run_scenario(
+    title: str,
+    *,
+    clob_levels: List[ClobLevel],
+    amm: Optional[AMM],
+    target_out: Decimal,
+    send_max: Optional[Decimal] = None,
+    deliver_min: Optional[Decimal] = None,
+):
+    print("\n" + "=" * 80)
+    print(f"Scenario: {title}")
+    # Build CLOB segments
+    if clob_levels is not None:
+        book = Clob(clob_levels, in_is_xrp=False, out_is_xrp=False)
+        segs = book.segments()
+    else:
+        segs = []
+    print("Market:")
+    print("  ", brief_book(clob_levels))
+    if amm is not None:
+        print(f"  AMM: reserves X={amm.x}, Y={amm.y}, SPQ={amm.spq()}")
+    else:
+        print("  AMM: (none)")
 
-# AMM anchoring callback: anchor to LOB top-tier quality each iteration
-amm_anchor = lambda q_threshold, need: amm.synthetic_segment_for_quality(
-    q_threshold, max_out_cap=need
-)
+    # Anchoring & writeback callbacks
+    amm_anchor: Optional[Callable[[Decimal, Decimal], Optional[object]]] = None
+    iter_no = {"n": 0}
 
-# Track iterations for clarity
-iter_no = {"n": 0}
+    if amm is not None:
+        amm_anchor = lambda q_threshold, need: amm.synthetic_segment_for_quality(
+            q_threshold, max_out_cap=need
+        )
+        amm_curve = lambda need: amm.segments_for_out(need)
 
-def after_iter(sum_in, sum_out):
-    # Apply the iteration's AMM fill back to pool and report new state
-    iter_no["n"] += 1
-    amm.apply_fill(sum_in, sum_out)
-    print(f"[iteration {iter_no['n']}] AMM fill: +{sum_in} IN, -{sum_out} OUT")
-    print(f"[iteration {iter_no['n']}] AMM reserves: X={amm.x} Y={amm.y} SPQ={amm.spq()}")
+        def after_iter(sum_in: Decimal, sum_out: Decimal) -> None:
+            iter_no["n"] += 1
+            amm.apply_fill(sum_in, sum_out)
+            print(f"    [iter {iter_no['n']}] AMM writeback: +{sum_in} IN, -{sum_out} OUT; new SPQ={amm.spq()}")
+    else:
+        def after_iter(sum_in: Decimal, sum_out: Decimal) -> None:
+            pass
 
-# -------- Scenario A: unconstrained anchored routing --------
-print("\n=== Scenario A: Unconstrained (target_out=80) ===")
-print("Plan: anchor AMM to LOB top each iteration; no send_max/deliver_min.")
+        def amm_curve(need: Decimal):
+            return []
 
-target_out = Decimal("80")
-res = route(target_out, segs, amm_anchor=amm_anchor, after_iteration=after_iter)
-print_route_result("Anchored Route Result (CLOB + AMM)", res)
+    # Route
+    try:
+        res = route(
+            target_out,
+            segs,
+            amm_anchor=amm_anchor,
+            amm_curve=amm_curve,
+            send_max=send_max,
+            deliver_min=deliver_min,
+            after_iteration=after_iter,
+        )
+        print_result("Route Result", res.filled_out, res.spent_in, res.avg_quality, res.trace)
+    except RouteError as e:
+        print("\n=== Route Result ===")
+        print(f"Routing failed: {e}")
+        print(f"(target_out={target_out}, send_max={send_max}, deliver_min={deliver_min})")
 
-print("\n=== AMM state before Scenario B ===")
-print(f"Reserves: X={amm.x} Y={amm.y}")
-print(f"SPQ:      {amm.spq()}")
 
-# -------- Scenario B: with limits (send_max / deliver_min) --------
-print("\n=== Scenario B: With limits (target_out=80, send_max=80, deliver_min=75) ===")
-print("Plan: limit total IN to 80; require at least 75 OUT; enforce forward recompute under budget.")
+# ---------- build common fixtures ----------
 
-send_max = Decimal("80")
-deliver_min = Decimal("75")
+def mk_levels(ioi1: str, qty1: str, ioi2: Optional[str] = None, qty2: Optional[str] = None) -> List[ClobLevel]:
+    levels = [ClobLevel.from_numbers(ioi1, qty1)]
+    if ioi2 is not None and qty2 is not None:
+        levels.append(ClobLevel.from_numbers(ioi2, qty2))
+    return levels
 
-try:
-    res_limited = route(
-        target_out,
-        segs,  # CLOB segments only; AMM is injected per-iteration via amm_anchor
-        amm_anchor=amm_anchor,
-        send_max=send_max,
-        deliver_min=deliver_min,
-        after_iteration=after_iter,
+
+# ---------- run scenarios ----------
+if __name__ == "__main__":
+    # A) Both sources, unconstrained (single-tier fill)
+    levels_A = mk_levels("1.0100", "60", "1.0200", "100")
+    amm_A = AMM(x_reserve="10000", y_reserve="10150", fee="0.003", x_is_xrp=False, y_is_xrp=False)
+    run_scenario(
+        "A) both sources, unconstrained (target_out=80)",
+        clob_levels=levels_A,
+        amm=amm_A,
+        target_out=Decimal("80"),
     )
-    print_route_result("Anchored Route with Limits", res_limited)
-except RouteError as e:
-    print("\n--- Anchored Route with Limits ---")
-    print(f"Routing failed: {e}")
-    print(f"(send_max={send_max}, deliver_min={deliver_min}, target_out={target_out})")
+
+    # B) Both sources, send_max + deliver_min
+    levels_B = mk_levels("1.0100", "60", "1.0200", "100")
+    amm_B = AMM(x_reserve="10000", y_reserve="10150", fee="0.003", x_is_xrp=False, y_is_xrp=False)
+    run_scenario(
+        "B) both sources with limits (target_out=80, send_max=80, deliver_min=75)",
+        clob_levels=levels_B,
+        amm=amm_B,
+        target_out=Decimal("80"),
+        send_max=Decimal("80"),
+        deliver_min=Decimal("75"),
+    )
+
+    # C) CLOB strictly better than AMM (AMM contributes 0)
+    # Make AMM worse: small X, large Y, and/or higher fee to push SPQ below LOB top.
+    levels_C = mk_levels("1.0000", "50", "1.0100", "100")  # LOB top quality = 1.0
+    amm_C = AMM(x_reserve="8000", y_reserve="12000", fee="0.006", x_is_xrp=False, y_is_xrp=False)  # SPQ < 1.0 expected
+    run_scenario(
+        "C) CLOB strictly better; AMM anchored slice absent",
+        clob_levels=levels_C,
+        amm=amm_C,
+        target_out=Decimal("70"),
+    )
+
+    # D) AMM-only (no CLOB levels)
+    levels_D: List[ClobLevel] = []
+    amm_D = AMM(x_reserve="9000", y_reserve="9000", fee="0.003", x_is_xrp=False, y_is_xrp=False)
+    run_scenario(
+        "D) AMM-only (no CLOB)",
+        clob_levels=levels_D,
+        amm=amm_D,
+        target_out=Decimal("100"),
+    )
+
+    # E) Demand exceeds tier-1 capacity → multi-iteration
+    # LOB top 60 + AMM anchored ≈ 20 < target_out 120 → will enter tier-2 (LOB second level + re-anchored AMM)
+    levels_E = mk_levels("1.0100", "60", "1.0200", "100")
+    amm_E = AMM(x_reserve="10000", y_reserve="10150", fee="0.003", x_is_xrp=False, y_is_xrp=False)
+    run_scenario(
+        "E) multi-iteration (target_out=120)",
+        clob_levels=levels_E,
+        amm=amm_E,
+        target_out=Decimal("120"),
+    )
+
+    # F) Failure case: deliver_min cannot be met
+    levels_F = mk_levels("1.0300", "10")  # very small LOB; AMM also limited
+    amm_F = AMM(x_reserve="500", y_reserve="520", fee="0.003", x_is_xrp=False, y_is_xrp=False)
+    run_scenario(
+        "F) failure: deliver_min not met (target_out=200, deliver_min=150, send_max=120)",
+        clob_levels=levels_F,
+        amm=amm_F,
+        target_out=Decimal("200"),
+        send_max=Decimal("120"),
+        deliver_min=Decimal("150"),
+    )

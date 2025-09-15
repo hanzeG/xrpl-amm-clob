@@ -4,7 +4,7 @@ Implements tiered iterations per the whitepaper: each iteration consumes only th
 current highest-quality tier (same-quality slices), with proportional scaling on
 limits to preserve slice quality. Supports AMM anchoring: if provided, an
 `amm_anchor` callback can inject a synthetic AMM segment anchored to the LOB top
-quality for the current iteration. Tier selection is anchored to the current LOB top quality when a synthetic AMM slice is present. Supports send_max/deliver_min limits. Supports per-iteration AMM state writeback via an optional after_iteration callback.
+quality for the current iteration. Tier selection is anchored to the current LOB top quality when a synthetic AMM slice is present. Supports send_max/deliver_min limits. Supports per-iteration AMM state writeback via an optional after_iteration callback. When no CLOB top is available, the router can fall back to AMM curve segments via an optional amm_curve callback (AMM self-pricing for that iteration).
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ def route(target_out: Decimal,
           amm_anchor: Callable[[Decimal, Decimal], Optional[Segment]] | None = None,
           send_max: Optional[Decimal] = None,
           deliver_min: Optional[Decimal] = None,
+          amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]] = None,
           after_iteration: Optional[Callable[[Decimal, Decimal], None]] = None,
           ) -> RouteResult:
     """Route a target OUT across segments in descending quality order.
@@ -54,6 +55,8 @@ def route(target_out: Decimal,
         Maximum input amount allowed.
     deliver_min : Decimal | None, optional
         Minimum output amount required.
+    amm_curve : callable | None, optional
+        When no CLOB top quality exists in an iteration, this callback is used to supply AMM curve segments directly (self-pricing). It receives (need) and must return Iterable[Segment].
     after_iteration : callable | None, optional
         If provided, called at the end of each iteration with (sum_in_AMM, sum_out_AMM) actually executed in that iteration; use to update AMM reserves.
     """
@@ -85,17 +88,31 @@ def route(target_out: Decimal,
     while need > 0 and segs:
         # Anchoring per iteration
         q_lob_top = max((s.quality for s in segs if s.src != "AMM"), default=Decimal(0))
-        synth: Optional[Segment] = None
-        if amm_anchor and q_lob_top > 0:
-            synth = amm_anchor(q_lob_top, need)
+        curve_mode = False
 
+        synth: Optional[Segment] = None
         iter_segs = list(segs)
-        if synth is not None:
-            iter_segs.append(synth)
+
+        if q_lob_top > 0 and amm_anchor:
+            synth = amm_anchor(q_lob_top, need)
+            if synth is not None:
+                iter_segs.append(synth)
+        elif q_lob_top == 0 and amm_curve is not None:
+            # No CLOB top in this iteration → AMM self-pricing via curve segments
+            curve_mode = True
+            try:
+                curve_segs = list(amm_curve(need))
+            except TypeError:
+                # Backward compatibility: allow amm_curve to be defined as Callable[[Decimal], Iterable[Segment]]
+                curve_segs = []
+            # Filter invalid segments
+            curve_segs = [cs for cs in curve_segs if cs and cs.out_max > 0 and cs.in_at_out_max > 0 and cs.quality > 0]
+            iter_segs.extend(curve_segs)
+
         if not iter_segs:
             break
 
-        # Sort candidates after injecting synthetic AMM to ensure proper tiering
+        # Sort candidates after injecting synth/curve segments to ensure proper tiering
         iter_segs.sort(key=lambda s: s.quality, reverse=True)
 
         iter_amm_in: Decimal = Decimal(0)
@@ -103,7 +120,7 @@ def route(target_out: Decimal,
 
         tier: List[Segment] = []
         rest: List[Segment] = []
-        if synth is not None and q_lob_top > 0:
+        if synth is not None and q_lob_top > 0 and not curve_mode:
             # Anchor the tier to LOB top quality: include synth and all quotes at that tier
             tier_quality = q_lob_top
             for s in iter_segs:
