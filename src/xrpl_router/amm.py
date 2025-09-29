@@ -21,12 +21,12 @@ from .core import (
     round_in_min,
     round_out_max,
     quantize_quality,
+    quality_bucket,
     XRP_QUANTUM,
     IOU_QUANTUM,
     Segment,
     calc_quality,
 )
-
 
 class AMM:
     """AMM(X,Y) with constant product math and input-side fee.
@@ -69,9 +69,33 @@ class AMM:
             return Decimal(0)
         return quantize_quality((self.y / self.x) * (Decimal(1) - self.fee))
 
+    def preview_fees_for_fill(self, dx_gross: Decimal | str | float, dy_net: Decimal | str | float) -> tuple[Decimal, Decimal, Decimal]:
+        """Preview fee breakdown for a hypothetical fill without mutating state.
+
+        Returns (fee_pool, fee_tr_in, fee_tr_out) on the *user* grids, using the same rounding
+        conventions as the swap/apply methods where applicable.
+        """
+        dx_g = round_out_max(clamp_nonneg(to_decimal(dx_gross)), is_xrp=self.x_is_xrp)
+        dy_n = round_out_max(clamp_nonneg(to_decimal(dy_net)), is_xrp=self.y_is_xrp)
+        fee_tr_in = Decimal(0)
+        fee_pool = Decimal(0)
+        fee_tr_out = Decimal(0)
+        if dx_g > 0:
+            fee_tr_in = dx_g * (self.tr_in if self.tr_in > 0 else Decimal(0))
+            dx_after_tf = dx_g - fee_tr_in
+            fee_pool = dx_after_tf * (self.fee if self.fee > 0 else Decimal(0))
+            # keep on IN grid (no extra quantisation to avoid bias in preview)
+        if dy_n > 0 and self.tr_out > 0:
+            one_minus_tr_out = (Decimal(1) - self.tr_out)
+            if one_minus_tr_out > 0:
+                # pool must send gross so user receives dy_n
+                dy_gross = quantize_up(dy_n / one_minus_tr_out, XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM)
+                fee_tr_out = dy_gross - dy_n
+        return (fee_pool, fee_tr_in, fee_tr_out)
+
     # --- Swaps ---
     def swap_out_given_in(self, dx: Decimal | str | float) -> Decimal:
-        """Max OUT for a given IN budget (floored to OUT grid)."""
+        """Max OUT for a given IN budget: IN budget is rounded down to the ledger grid; OUT is rounded down."""
         dx_gross = round_out_max(clamp_nonneg(to_decimal(dx)), is_xrp=self.x_is_xrp)
         if dx_gross <= 0 or self.x <= 0 or self.y <= 0:
             return Decimal(0)
@@ -133,36 +157,78 @@ class AMM:
                                       *,
                                       max_out_cap: Decimal | str | float | None = None
                                       ) -> Segment | None:
-        """Produce a single AMM slice whose average quality ~= q_threshold."""
+        """Produce a single AMM slice whose *average* quality ~= q_threshold
+        and whose *post-trade SPQ* (spot price quality) would remain >= q_threshold.
+
+        This method implements the whitepaper's anchoring rule when AMM and CLOB
+        coexist in the same book/tier (1.2.7.2):
+        - If AMM SPQ is better than the CLOB top quality, generate a synthetic slice
+          such that *after consuming that slice* the AMM's new SPQ is still at least
+          as good as the CLOB top quality. This keeps path ordering stable.
+
+        The method performs a conservative feasibility check using the same fee and
+        grid policies as `apply_fill`, but without mutating the pool. If the initial
+        anchored slice would push SPQ below the threshold, it shrinks the OUT size by
+        bisection until the post-trade SPQ >= threshold (or returns None if no
+        feasible positive slice exists).
+        """
+        # Basic guards
         if self.x <= 0 or self.y <= 0:
             return None
         q = clamp_nonneg(to_decimal(q_threshold))
         if q <= 0:
             return None
 
-        one_minus_fee = (Decimal(1) - self.fee)
+        # Local helpers mirroring `apply_fill` without mutating state
+        one = Decimal("1")
+        x_quant = XRP_QUANTUM if self.x_is_xrp else IOU_QUANTUM
+        y_quant = XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM
+        one_minus_fee = (one - self.fee)
         if one_minus_fee <= 0:
             return None
+        one_minus_tr_in = (one - self.tr_in) if self.tr_in > 0 else one
+        one_minus_tr_out = (one - self.tr_out) if self.tr_out > 0 else one
+        if one_minus_tr_in <= 0 or one_minus_tr_out <= 0:
+            return None
 
+        def preview_new_spq(dx_gross: Decimal, dy_net: Decimal) -> Decimal:
+            """Compute SPQ after hypothetically applying (dx_gross, dy_net)."""
+            # Pool-side deltas as in `apply_fill`
+            dx_to_pool = dx_gross * (one_minus_tr_in if self.tr_in > 0 else one)
+            dy_from_pool = dy_net
+            if self.tr_out > 0:
+                # Gross OUT that must leave the pool so user receives dy_net
+                dy_from_pool = quantize_up(dy_net / one_minus_tr_out, y_quant)
+            # Quantise deltas conservatively (same policy as apply_fill)
+            dx_to_pool = quantize_up(dx_to_pool, x_quant)
+            # dy_from_pool already on OUT grid (floored earlier) or quantized up above when tr_out>0
+            if dy_from_pool >= self.y:
+                return Decimal(0)  # would drain the pool
+            x_new = self.x + dx_to_pool
+            y_new = self.y - dy_from_pool
+            if x_new <= 0 or y_new <= 0:
+                return Decimal(0)
+            # New SPQ ≈ (y/x)*(1-fee), quantised down
+            return quantize_quality((y_new / x_new) * one_minus_fee)
+
+        # Step 1: initial anchored guess — follow current implementation logic.
+        # Compute a tentative dy from target quality and optional cap.
+        # We start with a theoretical dy that would (roughly) keep SPQ near q,
+        # then we will verify/adjust it via preview_new_spq.
         dy_theory = self.y - (q * self.x) / one_minus_fee
-
-        y_quant = XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM
         if max_out_cap is not None:
             cap = clamp_nonneg(to_decimal(max_out_cap))
             if cap > 0 and dy_theory > cap:
                 dy_theory = cap
-
-        dy = round_out_max(dy_theory, is_xrp=self.y_is_xrp)
-        if dy <= 0 or dy >= self.y:
+        dy_net = round_out_max(dy_theory, is_xrp=self.y_is_xrp)
+        if dy_net <= 0 or dy_net >= self.y:
             return None
 
-        # Anchor average quality to q (user view: OUT_net / IN_gross)
-        dy_net = dy
-        # First guess gross IN from anchored quality
+        # First-pass gross IN from anchored average quality
         dx_gross = round_in_min(dy_net / q, is_xrp=self.x_is_xrp)
         if dx_gross <= 0:
             return None
-        # Check feasibility against full fee model; if not enough, reduce dy_net
+        # Feasibility check against full fee model on the *current* reserves
         dy_check = self.swap_out_given_in(dx_gross)
         if dy_check <= 0:
             return None
@@ -171,7 +237,42 @@ class AMM:
             dx_gross = round_in_min(dy_net / q, is_xrp=self.x_is_xrp)
             if dx_gross <= 0:
                 return None
+
+        # Step 2: enforce post-trade SPQ >= threshold via monotone shrink (bisection)
+        spq_after = preview_new_spq(dx_gross, dy_net)
+        if spq_after < q:
+            # Binary search on dy_net in (0, dy_net] while maintaining anchored average quality
+            lo = Decimal(0)
+            hi = dy_net
+            # Limit iterations to avoid pathological loops
+            for _ in range(40):
+                if hi - lo <= y_quant:
+                    break
+                mid = round_out_max((lo + hi) / 2, is_xrp=self.y_is_xrp)
+                if mid <= 0:
+                    break
+                dx_mid = round_in_min(mid / q, is_xrp=self.x_is_xrp)
+                if dx_mid <= 0:
+                    # Too small; move lower bound up to avoid zero-in
+                    lo = mid
+                    continue
+                spq_mid = preview_new_spq(dx_mid, mid)
+                if spq_mid >= q:
+                    # Feasible; try larger
+                    dy_net = mid
+                    dx_gross = dx_mid
+                    lo = mid
+                else:
+                    # Infeasible; shrink
+                    hi = mid
+            # Final feasibility check
+            spq_after = preview_new_spq(dx_gross, dy_net)
+            if spq_after < q or dy_net <= 0:
+                return None
+
+        # Finalise slice quality conservatively
         q_slice = calc_quality(dy_net, dx_gross)
+        q_slice = quality_bucket(q_slice)
         if q_slice <= 0:
             return None
 
@@ -186,16 +287,25 @@ class AMM:
 
     # --- Segmentation (standalone; not used by anchored routing) ---
     def segments_for_out(self,
-                         target_out: Decimal | str | float,
-                         *,
-                         max_segments: int = 30,
-                         start_fraction: Decimal = Decimal("1e-4")) -> List[Segment]:
-        """Discretise AMM curve into fixed-quality slices up to target OUT."""
+                        target_out: Decimal | str | float,
+                        *,
+                        max_segments: int = 30,
+                        start_fraction: Decimal = Decimal("1e-4")) -> List[Segment]:
+        """Discretise AMM curve into slices up to target OUT using *shadow reserves*.
+
+        Within one router iteration, successive slices are priced on a virtual
+        state (x_hat, y_hat) updated after each slice (virtual writeback).
+        This makes later slices strictly worse on average even if out sizes
+        repeat (e.g., 20, 20, 40, ...). Real pool state is not mutated here;
+        the router applies the actual writeback after the iteration.
+        """
         remaining = clamp_nonneg(to_decimal(target_out))
         if remaining <= 0 or self.y <= 0 or self.x <= 0:
             return []
 
         y_quant = XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM
+        x_quant = XRP_QUANTUM if self.x_is_xrp else IOU_QUANTUM
+
         base = self.y * start_fraction
         if base <= 0:
             return []
@@ -203,39 +313,107 @@ class AMM:
         if base <= 0:
             base = y_quant
 
+        # Shadow reserves (local); do not touch real pool state here
+        x_hat = self.x
+        y_hat = self.y
+
+        one = Decimal("1")
+        one_minus_fee = (one - self.fee)
+        one_minus_tr_in = (one - self.tr_in) if self.tr_in > 0 else one
+        one_minus_tr_out = (one - self.tr_out) if self.tr_out > 0 else one
+        if one_minus_fee <= 0 or one_minus_tr_in <= 0 or one_minus_tr_out <= 0:
+            return []
+
+        def _swap_in_given_out_on(x_: Decimal, y_: Decimal, dy_net: Decimal) -> Decimal:
+            # dy_net is net-to-user OUT on the OUT grid
+            dy_net = quantize_up(clamp_nonneg(to_decimal(dy_net)), y_quant)
+            if dy_net <= 0:
+                return Decimal(0)
+            # gross out from pool (issuer fee on receiver side if any)
+            dy_gross = quantize_up(dy_net / one_minus_tr_out, y_quant) if self.tr_out > 0 else dy_net
+            if dy_gross >= y_:
+                return Decimal(0)
+            # curve math on shadow state
+            dx_eff = (dy_gross * x_) / (y_ - dy_gross)
+            if dx_eff <= 0:
+                return Decimal(0)
+            # undo pool fee and issuer in-fee to get user gross IN
+            dx_after_tf = dx_eff / one_minus_fee
+            dx_gross = dx_after_tf / one_minus_tr_in if self.tr_in > 0 else dx_after_tf
+            return round_in_min(dx_gross, is_xrp=self.x_is_xrp)
+
+        def _swap_out_given_in_on(x_: Decimal, y_: Decimal, dx_gross: Decimal) -> Decimal:
+            dx_gross = round_out_max(clamp_nonneg(to_decimal(dx_gross)), is_xrp=self.x_is_xrp)
+            if dx_gross <= 0 or x_ <= 0 or y_ <= 0:
+                return Decimal(0)
+            dx_after_tf = dx_gross * (one_minus_tr_in if self.tr_in > 0 else one)
+            dx_eff = dx_after_tf * one_minus_fee
+            if dx_eff <= 0:
+                return Decimal(0)
+            dy_gross_theory = (y_ * dx_eff) / (x_ + dx_eff)
+            dy_gross = round_out_max(dy_gross_theory, is_xrp=self.y_is_xrp)
+            dy_net = dy_gross * (one_minus_tr_out if self.tr_out > 0 else one)
+            dy_net = round_out_max(dy_net, is_xrp=self.y_is_xrp)
+            return dy_net
+
         segs: List[Segment] = []
         f_prev, f_curr = 1, 1
 
         while remaining > 0 and len(segs) < max_segments:
             proposed = base * f_curr
-            proposed = proposed if proposed <= remaining else remaining
+            if proposed > remaining:
+                proposed = remaining
 
+            # Request OUT on the grid for this slice from the *shadow* state
             out_req = quantize_up(proposed, y_quant)
             if out_req <= 0:
                 break
-            if out_req >= self.y:
-                break
+            if out_req >= y_hat:
+                break  # avoid draining shadow pool side
 
-            in_need = self.swap_in_given_out(out_req)
+            # Compute IN needed on shadow state
+            in_need = _swap_in_given_out_on(x_hat, y_hat, out_req)
             if in_need <= 0:
                 break
 
-            q = calc_quality(out_req, in_need)
+            # Recompute obtainable OUT from that IN on the same shadow state to
+            # ensure feasibility after grid/fee effects
+            dy_net = _swap_out_given_in_on(x_hat, y_hat, in_need)
+            if dy_net <= 0:
+                break
+            if dy_net > out_req:
+                # Cap to requested size for consistency
+                dy_net = out_req
+
+            q = calc_quality(dy_net, in_need)
+            q = quality_bucket(q)
             if q <= 0:
                 break
 
             segs.append(Segment(
                 src="AMM",
                 quality=q,
-                out_max=out_req,
+                out_max=dy_net,
                 in_at_out_max=in_need,
                 in_is_xrp=self.x_is_xrp,
                 out_is_xrp=self.y_is_xrp,
             ))
 
-            remaining = remaining - out_req
+            # Virtual writeback to shadow reserves (pool-side deltas)
+            dx_to_pool = in_need * (one_minus_tr_in if self.tr_in > 0 else one)
+            dy_from_pool = quantize_up(dy_net / one_minus_tr_out, y_quant) if self.tr_out > 0 else dy_net
+            dx_to_pool = round_out_max(dx_to_pool, is_xrp=self.x_is_xrp)
+            dy_from_pool = round_out_max(dy_from_pool, is_xrp=self.y_is_xrp)
+            if dy_from_pool >= y_hat:
+                break
+            x_hat = x_hat + dx_to_pool
+            y_hat = y_hat - dy_from_pool
+
+            remaining = remaining - dy_net
             if remaining <= 0:
                 break
+
+            # Fibonacci growth of slice sizes
             f_prev, f_curr = f_curr, f_prev + f_curr
 
         return segs
@@ -247,6 +425,7 @@ class AMM:
         `dx` is the actual IN paid by taker (already on grid in normal flows);
         `dy` is the actual OUT delivered to taker (on grid).
         Rounds to amount grids defensively and rejects draining Y.
+        Pool deltas are quantised once with non-undercredit/undebit policy to avoid bias.
         """
         dx_gross = round_in_min(clamp_nonneg(to_decimal(dx)), is_xrp=self.x_is_xrp)
         dy_net = round_out_max(clamp_nonneg(to_decimal(dy)), is_xrp=self.y_is_xrp)
@@ -261,9 +440,20 @@ class AMM:
                 return
             # Pool must send more so that user receives dy_net
             dy_from_pool = quantize_up(dy_net / one_minus_tr_out, XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM)
-        # Quantise deltas to grids (defensive)
-        dx_to_pool = round_out_max(dx_to_pool, is_xrp=self.x_is_xrp)
-        dy_from_pool = round_out_max(dy_from_pool, is_xrp=self.y_is_xrp)
+        # Quantise deltas to ledger grids with *non-undercredit/undebit* policy:
+        # - Credit to pool (dx_to_pool): quantise UP to avoid under-crediting x-reserve.
+        # - Debit from pool (dy_from_pool):
+        #     * if tr_out>0, we've already quantised UP the gross (so user receives dy_net);
+        #     * if tr_out==0, dy_net is already on the OUT grid from swap; do not re-round.
+        x_quant = XRP_QUANTUM if self.x_is_xrp else IOU_QUANTUM
+        y_quant = XRP_QUANTUM if self.y_is_xrp else IOU_QUANTUM
+        dx_to_pool = quantize_up(dx_to_pool, x_quant)
+        if self.tr_out == 0:
+            # dy_from_pool == dy_net already floored to OUT grid in swap; keep as-is.
+            pass
+        else:
+            # already quantized up above; keep as-is.
+            pass
         if dy_from_pool >= self.y:
             raise ValueError("apply_fill would drain Y reserve (gross)")
         # Update reserves

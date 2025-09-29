@@ -14,6 +14,7 @@ from .core import (
     calc_quality,
     round_in_min,
     round_out_max,
+    quality_bucket,
 )
 
 
@@ -75,7 +76,8 @@ class Clob:
             in_gross = round_in_min(in_req_at_price, is_xrp=self.in_is_xrp)
             if in_gross <= 0:
                 continue
-            q = calc_quality(out_net, in_gross)
+            # Use quality bucket for tier grouping.
+            q = quality_bucket(calc_quality(out_net, in_gross))
             if q <= 0:
                 continue
             segs.append(Segment(

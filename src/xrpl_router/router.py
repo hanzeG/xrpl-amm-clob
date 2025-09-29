@@ -4,7 +4,9 @@ Implements tiered iterations per the whitepaper: each iteration consumes only th
 current highest-quality tier (same-quality slices), with proportional scaling on
 limits to preserve slice quality. Supports AMM anchoring: if provided, an
 `amm_anchor` callback can inject a synthetic AMM segment anchored to the LOB top
-quality for the current iteration. Tier selection is anchored to the current LOB top quality when a synthetic AMM slice is present. Supports send_max/deliver_min limits. Supports per-iteration AMM state writeback via an optional after_iteration callback. When no CLOB top is available, the router can fall back to AMM curve segments via an optional amm_curve callback (AMM self-pricing for that iteration).
+quality for the current iteration. Tier selection is anchored to the current LOB top quality when a synthetic AMM slice is present. Supports send_max/deliver_min limits. Supports per-iteration AMM state writeback via an optional after_iteration callback. When no CLOB top is available, the router can fall back to AMM curve segments via an optional amm_curve callback (AMM self-pricing for that iteration). AMM residual slices are not carried across iterations; they are re-sourced after writeback.
+
+The `limit_quality` parameter (optional) enforces a per-iteration quality floor consistent with the whitepaper flow(Strands)/offer crossing semantics. If provided, only segments at or above this quality (bucketed) are considered in each iteration.
 """
 from __future__ import annotations
 
@@ -12,7 +14,21 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable, List, Dict, Callable, Optional
 
-from .core import Segment, RouteResult, quantize_down, round_in_min, round_out_max
+from .core import (
+    Segment,
+    RouteResult,
+    quantize_down,
+    round_in_min,
+    round_out_max,
+    quality_bucket,
+    XRP_QUANTUM,
+    IOU_QUANTUM,
+    ExecutionReport,
+    IterationMetrics,
+    ROUTING_CFG,
+)
+
+from .amm_context import AMMContext
 
 
 class RouteError(Exception):
@@ -29,36 +45,22 @@ class RouteConfig:
     preserve_quality_on_limit: bool = True
 
 
-def route(target_out: Decimal,
-          segments: Iterable[Segment],
-          *,
-          config: RouteConfig | None = None,
-          amm_anchor: Callable[[Decimal, Decimal], Optional[Segment]] | None = None,
-          send_max: Optional[Decimal] = None,
-          deliver_min: Optional[Decimal] = None,
-          amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]] = None,
-          after_iteration: Optional[Callable[[Decimal, Decimal], None]] = None,
-          ) -> RouteResult:
+def route(
+    target_out: Decimal,
+    segments: Iterable[Segment],
+    *,
+    config: RouteConfig | None = None,
+    amm_anchor: Callable[[Decimal, Decimal], Optional[Segment]] | None = None,
+    send_max: Optional[Decimal] = None,
+    deliver_min: Optional[Decimal] = None,
+    limit_quality: Optional[Decimal] = None,
+    amm_context: AMMContext | None = None,
+    amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]] = None,
+    after_iteration: Optional[Callable[[Decimal, Decimal], None]] = None,
+) -> RouteResult:
     """Route a target OUT across segments in descending quality order.
 
-    Parameters
-    ----------
-    target_out : Decimal
-        The desired output amount to route.
-    segments : Iterable[Segment]
-        The segments to route through.
-    config : RouteConfig | None, optional
-        Router configuration options.
-    amm_anchor : callable | None, optional
-        Function to inject synthetic AMM segment anchored to LOB top quality.
-    send_max : Decimal | None, optional
-        Maximum input amount allowed.
-    deliver_min : Decimal | None, optional
-        Minimum output amount required.
-    amm_curve : callable | None, optional
-        When no CLOB top quality exists in an iteration, this callback is used to supply AMM curve segments directly (self-pricing). It receives (need) and must return Iterable[Segment].
-    after_iteration : callable | None, optional
-        If provided, called at the end of each iteration with (sum_in_AMM, sum_out_AMM) actually executed in that iteration; use to update AMM reserves.
+    The optional `limit_quality` enforces a per-iteration quality floor (bucketed), consistent with the whitepaper flow(Strands)/offer crossing semantics.
     """
     if target_out is None:
         raise RouteError("target_out is None")
@@ -69,10 +71,30 @@ def route(target_out: Decimal,
         s for s in segments
         if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)
     ]
+
+    # Deterministic tie-breaker: remember insertion order for stable secondary sort
+    order_map: Dict[Segment, int] = {}
+    def _ensure_order_for_list(lst: List[Segment]) -> None:
+        for s in lst:
+            if s not in order_map:
+                order_map[s] = len(order_map)
+    _ensure_order_for_list(segs)
+
+    # AMM-only bootstrap: if no CLOB segments were provided, try curve once
+    if not segs and amm_curve is not None:
+        try:
+            curve_boot = list(amm_curve(target_out))
+        except TypeError:
+            curve_boot = []  # backward-compat: older signature
+        segs = [
+            s for s in curve_boot
+            if (s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)
+        ]
+
     if not segs:
         raise RouteError("no usable segments")
 
-    segs.sort(key=lambda s: s.quality, reverse=True)
+    segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
 
     filled_out: Decimal = Decimal(0)
     spent_in: Decimal = Decimal(0)
@@ -85,7 +107,48 @@ def route(target_out: Decimal,
     eff_send_max = send_max if (send_max is not None) else None
     eff_deliver_min = deliver_min if (deliver_min is not None) else None
 
-    while need > 0 and segs:
+    ctx = amm_context or AMMContext(False)
+
+    def _amm_out_cap_for_iter(remaining_out: Decimal) -> Decimal:
+        """Return the AMM OUT cap for this iteration under multi-path Fibonacci policy."""
+        if not ctx.multi_path:
+            return remaining_out
+        # Conservative base cap: small fraction of remaining need, at least one IOU quantum
+        base = (remaining_out * ROUTING_CFG.fib_base_factor) if remaining_out > 0 else IOU_QUANTUM
+        if base <= 0:
+            base = IOU_QUANTUM
+        cap = ctx.current_fib_cap(base)
+        if cap <= 0:
+            cap = IOU_QUANTUM
+        return min(cap, remaining_out)
+
+    # --- Metrics reporting ---
+    iter_records: List[IterationMetrics] = []
+    iter_idx: int = 0
+    limit_floor = limit_quality  # keep original value for reporting
+
+    # Compute quality floor bucket if limit_quality is provided
+    if limit_quality is not None:
+        qmin_bucket = quality_bucket(limit_quality)
+    else:
+        qmin_bucket = None
+
+    while need > 0:
+        # If no segments are available at the start of an iteration, try sourcing from AMM curve
+        if (not segs) and (amm_curve is not None):
+            try:
+                refilled = list(amm_curve(need))
+            except TypeError:
+                refilled = []
+            segs = [s for s in refilled if (s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)]
+            _ensure_order_for_list(segs)
+            # If still empty after attempting to refill, break (nothing more to route)
+            if not segs:
+                break
+        elif not segs:
+            # No segments and no AMM curve to source from
+            break
+
         # Anchoring per iteration
         q_lob_top = max((s.quality for s in segs if s.src != "AMM"), default=Decimal(0))
         curve_mode = False
@@ -94,156 +157,363 @@ def route(target_out: Decimal,
         iter_segs = list(segs)
 
         if q_lob_top > 0 and amm_anchor:
-            synth = amm_anchor(q_lob_top, need)
-            if synth is not None:
-                iter_segs.append(synth)
+            if not ctx.max_iters_reached():
+                cap_out = _amm_out_cap_for_iter(need)
+                synth = amm_anchor(q_lob_top, need)
+                if synth is not None:
+                    # Trim synthetic slice to Fibonacci cap if necessary (preserve slice ratio)
+                    if cap_out > 0 and synth.out_max > cap_out:
+                        ratio = (synth.in_at_out_max / synth.out_max) if synth.out_max > 0 else Decimal(0)
+                        new_out = cap_out
+                        new_in = round_in_min(new_out * ratio, is_xrp=synth.in_is_xrp)
+                        # Guard instantaneous quality not to exceed slice quality (quantised bump if needed)
+                        if new_in > 0 and (new_out / new_in) > synth.quality:
+                            q_in_quant = XRP_QUANTUM if synth.in_is_xrp else IOU_QUANTUM
+                            new_in = round_in_min(new_in + q_in_quant, is_xrp=synth.in_is_xrp)
+                        synth = Segment(
+                            src=synth.src,
+                            quality=synth.quality,
+                            out_max=new_out,
+                            in_at_out_max=new_in,
+                            in_is_xrp=synth.in_is_xrp,
+                            out_is_xrp=synth.out_is_xrp,
+                        )
+                    iter_segs.append(synth)
         elif q_lob_top == 0 and amm_curve is not None:
-            # No CLOB top in this iteration → AMM self-pricing via curve segments
+            # No CLOB top → AMM self-pricing via curve segments
             curve_mode = True
-            try:
-                curve_segs = list(amm_curve(need))
-            except TypeError:
-                # Backward compatibility: allow amm_curve to be defined as Callable[[Decimal], Iterable[Segment]]
-                curve_segs = []
-            # Filter invalid segments
-            curve_segs = [cs for cs in curve_segs if cs and cs.out_max > 0 and cs.in_at_out_max > 0 and cs.quality > 0]
+            curve_segs = []
+            if not ctx.max_iters_reached():
+                try:
+                    curve_segs = list(amm_curve(need))
+                except TypeError:
+                    curve_segs = []  # backward-compat signature
+                # Filter invalid segments
+                curve_segs = [cs for cs in curve_segs if cs and cs.out_max > 0 and cs.in_at_out_max > 0 and cs.quality > 0]
+                # Enforce Fibonacci cap across curve segments in this iteration
+                cap_out = _amm_out_cap_for_iter(need)
+                if cap_out > 0:
+                    taken: List[Segment] = []
+                    remaining_cap = cap_out
+                    for cs in curve_segs:
+                        if remaining_cap <= 0:
+                            break
+                        take_out = min(cs.out_max, remaining_cap)
+                        if take_out <= 0:
+                            continue
+                        if take_out < cs.out_max:
+                            ratio = (cs.in_at_out_max / cs.out_max) if cs.out_max > 0 else Decimal(0)
+                            new_in = round_in_min(take_out * ratio, is_xrp=cs.in_is_xrp)
+                            # Quality guard as above
+                            if new_in > 0 and (take_out / new_in) > cs.quality:
+                                q_in_quant = XRP_QUANTUM if cs.in_is_xrp else IOU_QUANTUM
+                                new_in = round_in_min(new_in + q_in_quant, is_xrp=cs.in_is_xrp)
+                            taken.append(Segment(
+                                src=cs.src,
+                                quality=cs.quality,
+                                out_max=take_out,
+                                in_at_out_max=new_in,
+                                in_is_xrp=cs.in_is_xrp,
+                                out_is_xrp=cs.out_is_xrp,
+                            ))
+                            remaining_cap -= take_out
+                        else:
+                            taken.append(cs)
+                            remaining_cap -= cs.out_max
+                    curve_segs = taken
             iter_segs.extend(curve_segs)
 
+        _ensure_order_for_list(iter_segs)
+
+        # Apply per-iteration quality floor if requested
+        if qmin_bucket is not None:
+            iter_segs = [s for s in iter_segs if quality_bucket(s.quality) >= qmin_bucket]
+
         if not iter_segs:
-            break
+            # Drop any AMM segments (none should remain), and if amm_curve is available and segs is empty, try refill once
+            segs = [s for s in segs if s.src != "AMM"]
+            if amm_curve is not None and not segs:
+                try:
+                    refilled = list(amm_curve(need))
+                except TypeError:
+                    refilled = []
+                segs = [s for s in refilled if (s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)]
+                _ensure_order_for_list(segs)
+                # Apply the same filter to the refilled segments
+                if qmin_bucket is not None:
+                    segs = [s for s in segs if quality_bucket(s.quality) >= qmin_bucket]
+                iter_segs = list(segs)
+                if not iter_segs:
+                    break
+            else:
+                break
 
         # Sort candidates after injecting synth/curve segments to ensure proper tiering
-        iter_segs.sort(key=lambda s: s.quality, reverse=True)
+        iter_segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
 
         iter_amm_in: Decimal = Decimal(0)
         iter_amm_out: Decimal = Decimal(0)
 
         tier: List[Segment] = []
         rest: List[Segment] = []
+        # Record the tier bucket used this iteration for reporting
         if synth is not None and q_lob_top > 0 and not curve_mode:
-            # Anchor the tier to LOB top quality: include synth and all quotes at that tier
-            tier_quality = q_lob_top
+            current_tier_bucket = quality_bucket(q_lob_top)
+            # Anchor the tier to LOB top quality bucket: include synth and all segments in that bucket
+            tier_bucket = quality_bucket(q_lob_top)
             for s in iter_segs:
-                if (s is synth) or (s.quality == tier_quality):
+                if (s is synth) or (quality_bucket(s.quality) == tier_bucket):
                     tier.append(s)
                 else:
                     rest.append(s)
         else:
-            # Default: take the highest-quality tier
-            max_quality = iter_segs[0].quality
+            current_tier_bucket = max(quality_bucket(s.quality) for s in iter_segs) if iter_segs else Decimal(0)
+            # Default: take the highest-quality bucket tier
+            max_bucket = max(quality_bucket(s.quality) for s in iter_segs)
             for s in iter_segs:
-                (tier if s.quality == max_quality else rest).append(s)
+                (tier if quality_bucket(s.quality) == max_bucket else rest).append(s)
 
         new_tier: List[Segment] = []
-        for s in tier:
-            if need <= 0:
-                new_tier.append(s)
+
+        if need > 0 and tier:
+            # Phase A: proportional ideal takes using slice-specific average ratio
+            budget_scaled = False
+            tier_cap_out = sum(min(s.out_max, need) for s in tier)
+            if tier_cap_out <= 0:
+                # Nothing usable in this tier
+                # Drop any AMM segments before next iteration to avoid stale AMM pricing
+                segs = [s for s in rest if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")]
                 continue
 
-            # Plan proportional take
-            take_out_prop = s.out_max if s.out_max <= need else need
-            if take_out_prop <= 0:
-                new_tier.append(s)
-                continue
+            ratio_out = (need / tier_cap_out) if tier_cap_out > 0 else Decimal(0)
+            ideal_out = []  # per-slice ideal (pre-quantisation)
+            ideal_in = []   # per-slice ideal IN using slice-specific average ratio (captures AMM virtual writeback)
+            for s in tier:
+                out_prop = (min(s.out_max, need) * ratio_out)
+                ideal_out.append(out_prop)
+                slice_ratio = (s.in_at_out_max / s.out_max) if s.out_max > 0 else Decimal(0)
+                ideal_in.append(out_prop * slice_ratio)
 
-            ratio = take_out_prop / s.out_max
-            take_in_prop = s.in_at_out_max * ratio
+            # Note: Phase A's ideal_in is used only for checking whether tier-level scaling is needed under send_max.
+            # Actual per-slice IN is recomputed in Phase B from slice-specific ratio (in_at_out_max/out_max).
 
-            # Double-sided rounding to amount grids
-            take_out = round_out_max(take_out_prop, is_xrp=s.out_is_xrp)
-            take_in = round_in_min(take_in_prop, is_xrp=s.in_is_xrp)
-
-            if take_out <= 0 or take_in <= 0:
-                new_tier.append(s if s is synth else s)  # no change
-                continue
-
-            # Enforce instantaneous quality <= slice quality
-            inst_q = take_out / take_in
-            if inst_q > s.quality:
-                # Reduce OUT to match slice quality (then floor again)
-                take_out = round_out_max(take_in * s.quality, is_xrp=s.out_is_xrp)
-                if take_out <= 0:
-                    new_tier.append(s if s is synth else s)
-                    continue
-
-            # Enforce send_max if present (fit budget while keeping quality <= slice quality)
+            # Respect send_max by uniform scaling at tier-level (preserves slice quality)
             if eff_send_max is not None:
                 remaining_in_budget = eff_send_max - spent_in
                 if remaining_in_budget <= 0:
                     need = Decimal(0)
-                    break
-                if take_in > remaining_in_budget:
-                    # Forward recompute under IN budget: choose IN on its grid, derive OUT at anchored quality,
-                    # then cap OUT by remaining need and segment capacity, and recompute IN from OUT.
-                    allowed_in = round_in_min(remaining_in_budget, is_xrp=s.in_is_xrp)
-                    if allowed_in <= 0:
-                        need = Decimal(0)
+                    segs = rest
+                    continue
+                sum_ideal_in = sum(ideal_in)
+                if sum_ideal_in > remaining_in_budget and sum_ideal_in > 0:
+                    scale = (remaining_in_budget / sum_ideal_in)
+                    ideal_out = [x * scale for x in ideal_out]
+                    ideal_in = [x * scale for x in ideal_in]
+                    budget_scaled = True
+
+            # Phase B: grid rounding and simple largest-remainder top-up (≤1 quantum per slice)
+            flo_out = []
+            flo_in = []
+            rema = []  # fractional remainder of OUT (normalised by quantum)
+            quanta = []
+            sum_out = Decimal(0)
+            sum_in = Decimal(0)
+            for s, o, i in zip(tier, ideal_out, ideal_in):
+                q_out = XRP_QUANTUM if s.out_is_xrp else IOU_QUANTUM
+                q_in = XRP_QUANTUM if s.in_is_xrp else IOU_QUANTUM
+                out_floor = round_out_max(o, is_xrp=s.out_is_xrp)
+                # Bound by capacity
+                if out_floor > s.out_max:
+                    out_floor = round_out_max(s.out_max, is_xrp=s.out_is_xrp)
+                # Use slice-specific ratio from precomputed segment (captures AMM virtual writeback):
+                # ratio = in_at_out_max / out_max
+                if out_floor > 0:
+                    ratio = s.in_at_out_max / s.out_max
+                    in_ceil = round_in_min(out_floor * ratio, is_xrp=s.in_is_xrp)
+                    # Enforce instantaneous quality not to exceed the slice quality
+                    inst_q_chk = (out_floor / in_ceil) if in_ceil > 0 else Decimal(0)
+                    if inst_q_chk > s.quality:
+                        q_in_quant = XRP_QUANTUM if s.in_is_xrp else IOU_QUANTUM
+                        in_ceil = round_in_min(in_ceil + q_in_quant, is_xrp=s.in_is_xrp)
+                else:
+                    in_ceil = Decimal(0)
+                flo_out.append(out_floor)
+                flo_in.append(in_ceil)
+                quanta.append(q_out)
+                # remainder normalized by quantum to compare slices with different grids
+                rem = (o - out_floor) / q_out if q_out > 0 else Decimal(0)
+                rema.append(rem)
+                sum_out += out_floor
+                sum_in += in_ceil
+
+            # If we are short on OUT vs need, try topping up by at most one quantum per slice
+            need_goal = need
+            remaining_out_gap = need_goal - sum_out
+            if remaining_out_gap > 0:
+                order = sorted(range(len(tier)), key=lambda k: rema[k], reverse=True)
+                for k in order:
+                    if remaining_out_gap <= 0:
                         break
-                    # First pass OUT by quality from allowed IN
-                    out_by_quality = round_out_max(allowed_in * s.quality, is_xrp=s.out_is_xrp)
-                    # Cap by remaining need and segment capacity
-                    capped_out = out_by_quality
-                    if capped_out > need:
-                        capped_out = round_out_max(need, is_xrp=s.out_is_xrp)
-                    if capped_out > s.out_max:
-                        capped_out = round_out_max(s.out_max, is_xrp=s.out_is_xrp)
-                    if capped_out <= 0:
-                        need = Decimal(0)
-                        break
-                    # Recompute IN from capped OUT at anchored quality, ceil to grid; ensure within budget
-                    recomputed_in = round_in_min(capped_out / s.quality, is_xrp=s.in_is_xrp)
-                    if recomputed_in > remaining_in_budget:
-                        # Final safeguard: shrink OUT to fit budget exactly at anchored quality
-                        capped_out = round_out_max(remaining_in_budget * s.quality, is_xrp=s.out_is_xrp)
-                        if capped_out <= 0:
-                            need = Decimal(0)
-                            break
-                        recomputed_in = round_in_min(capped_out / s.quality, is_xrp=s.in_is_xrp)
-                        if recomputed_in <= 0:
-                            need = Decimal(0)
-                            break
-                    take_in = recomputed_in
-                    take_out = capped_out
+                    s = tier[k]
+                    q_out = quanta[k]
+                    if q_out <= 0:
+                        continue
+                    cand_out = flo_out[k] + q_out
+                    if cand_out > s.out_max or cand_out > need_goal:
+                        continue
+                    # Compute IN impact and check budget + quality guard
+                    ratio = s.in_at_out_max / s.out_max
+                    cand_in = round_in_min(cand_out * ratio, is_xrp=s.in_is_xrp)
+                    add_in = cand_in - flo_in[k]
+                    if eff_send_max is not None and (spent_in + sum_in + add_in) > eff_send_max:
+                        continue
+                    inst_q = cand_out / cand_in if cand_in > 0 else Decimal(0)
+                    if inst_q > s.quality:
+                        # Bump IN by one quantum to enforce anchored quality
+                        q_in_quant = XRP_QUANTUM if s.in_is_xrp else IOU_QUANTUM
+                        cand_in = round_in_min(cand_in + q_in_quant, is_xrp=s.in_is_xrp)
+                        inst_q = cand_out / cand_in if cand_in > 0 else Decimal(0)
+                        if inst_q > s.quality:
+                            continue
+                    # Accept top-up
+                    remaining_out_gap -= q_out
+                    sum_out += q_out
+                    sum_in += add_in
+                    flo_out[k] = cand_out
+                    flo_in[k] = cand_in
 
-            if s.src == "AMM":
-                iter_amm_in += take_in
-                iter_amm_out += take_out
+            # Per-iteration totals for reporting
+            iter_out_sum = sum(flo_out)
+            iter_in_sum = sum(flo_in)
+            iter_price_eff = (iter_in_sum / iter_out_sum) if iter_out_sum > 0 else Decimal(0)
+            # Baseline price for slippage: inverse of the tier quality bucket
+            baseline_price = (Decimal(1) / current_tier_bucket) if current_tier_bucket > 0 else Decimal(0)
+            slippage_price = (iter_price_eff - baseline_price) if baseline_price > 0 else Decimal(0)
+            # Fee components (pool fee and issuer transfer fees) are AMM-specific and require
+            # pool parameters; keep placeholders here. They can be populated by higher-level
+            # wrappers that know the concrete AMM instance.
+            fee_pool = Decimal(0)
+            fee_tr_in = Decimal(0)
+            fee_tr_out = Decimal(0)
 
-            # Apply
-            filled_out += take_out
-            spent_in += take_in
-            usage[s.src] = usage.get(s.src, Decimal(0)) + take_out
-            trace.append({
-                "src": s.src,
-                "take_out": take_out,
-                "take_in": take_in,
-                "quality": s.quality,
-            })
+            # Apply batched fills for this tier
+            # Also record Phase-A ideal (pre-grid) amounts for diagnostics: take_out_raw/take_in_raw/inst_q_raw
+            for s, out_i, in_i, o_raw, i_raw in zip(tier, flo_out, flo_in, ideal_out, ideal_in):
+                if out_i <= 0 or in_i <= 0:
+                    # Keep the original segment for future use if it still has capacity
+                    if s.out_max > 0 and s.in_at_out_max > 0:
+                        new_tier.append(s)
+                    continue
 
-            # Residual capacity (synthetic not carried to next round)
-            remaining_out = s.out_max - take_out
-            remaining_in_at_out_max = s.in_at_out_max - take_in
-            if remaining_out > 0 and remaining_in_at_out_max > 0 and s is not synth:
-                new_seg = Segment(
-                    src=s.src,
-                    out_max=remaining_out,
-                    in_at_out_max=remaining_in_at_out_max,
-                    quality=s.quality,
-                    in_is_xrp=s.in_is_xrp,
-                    out_is_xrp=s.out_is_xrp,
-                )
-                new_tier.append(new_seg)
+                if s.src == "AMM":
+                    iter_amm_in += in_i
+                    iter_amm_out += out_i
+
+                filled_out += out_i
+                spent_in += in_i
+                usage[s.src] = usage.get(s.src, Decimal(0)) + out_i
+                inst_q_raw = (o_raw / i_raw) if i_raw > 0 else Decimal(0)
+                trace.append({
+                    "src": s.src,
+                    "take_out": out_i,          # post-grid OUT (ledger)
+                    "take_in": in_i,            # post-grid IN (ledger)
+                    "quality": s.quality,       # slice quality (bucketed elsewhere in prints)
+                    # diagnostics (pre-grid, Phase A):
+                    "take_out_raw": o_raw,      # ideal OUT before rounding to grid
+                    "take_in_raw": i_raw,       # ideal IN before rounding to grid
+                    "inst_q_raw": inst_q_raw,   # ideal instantaneous quality (no bucket)
+                })
+
+                # Residual capacity (carry to next round only for non-AMM; synthetic never carried)
+                #
+                # Rationale:
+                # - Whitepaper iteration semantics require that after each round's fills are applied,
+                #   the AMM state (x,y) is updated and *then* AMM pricing/segments are recomputed.
+                # - If we were to carry an AMM residual slice across rounds, it would retain an
+                #   obsolete quality computed from the pre-writeback reserves, causing the next
+                #   round to compare/route against stale AMM pricing (e.g., inst_q seemingly
+                #   exceeding the newly printed SPQ). To avoid that, AMM residuals are dropped and
+                #   the AMM (if needed) will be re-sourced via `amm_anchor`/`amm_curve` using the
+                #   updated reserves.
+                rem_out = s.out_max - out_i
+                rem_in = s.in_at_out_max - in_i
+                if rem_out > 0 and rem_in > 0 and (s.quality > 0) and (s.src != "AMM") and (s is not synth):
+                    new_seg = Segment(
+                        src=s.src,
+                        out_max=rem_out,
+                        in_at_out_max=rem_in,
+                        quality=s.quality,
+                        in_is_xrp=s.in_is_xrp,
+                        out_is_xrp=s.out_is_xrp,
+                    )
+                    if new_seg not in order_map:
+                        order_map[new_seg] = len(order_map)
+                    new_tier.append(new_seg)
 
             need = target_out - filled_out
             if need <= 0:
+                # Append per-iteration metrics (complete fill)
+                iter_records.append(IterationMetrics(
+                    iter_index=iter_idx,
+                    tier_quality=current_tier_bucket,
+                    out_filled=iter_out_sum,
+                    in_spent=iter_in_sum,
+                    price_effective=iter_price_eff,
+                    amm_used=bool(iter_amm_in > 0 or iter_amm_out > 0),
+                    budget_limited=budget_scaled,
+                    limit_quality_floor=limit_floor,
+                    fee_pool=fee_pool,
+                    fee_tr_in=fee_tr_in,
+                    fee_tr_out=fee_tr_out,
+                    slippage_price=slippage_price,
+                ))
+                iter_idx += 1
+                segs = [
+                    s for s in (new_tier + rest)
+                    if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")
+                ]
+                _ensure_order_for_list(segs)
+                segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
+                if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
+                    if iter_amm_in > 0 or iter_amm_out > 0:
+                        ctx.mark_amm_used_this_iter()
+                        if ctx.multi_path:
+                            ctx.advance_fib()
+                    after_iteration(iter_amm_in, iter_amm_out)
                 break
+        else:
+            # Nothing to do in this tier
+            new_tier = tier
 
-        segs = new_tier + rest
-        segs = [s for s in segs if s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0]
-        segs.sort(key=lambda s: s.quality, reverse=True)
-        # Update AMM pool for next iteration
+        segs = [
+            s for s in (new_tier + rest)
+            if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")
+        ]
+        _ensure_order_for_list(segs)
+        segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
         if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
+            if iter_amm_in > 0 or iter_amm_out > 0:
+                ctx.mark_amm_used_this_iter()
+                if ctx.multi_path:
+                    ctx.advance_fib()
             after_iteration(iter_amm_in, iter_amm_out)
+        # Append per-iteration metrics (normal continue)
+        if need > 0 and tier:
+            iter_records.append(IterationMetrics(
+                iter_index=iter_idx,
+                tier_quality=current_tier_bucket,
+                out_filled=iter_out_sum,
+                in_spent=iter_in_sum,
+                price_effective=iter_price_eff,
+                amm_used=bool(iter_amm_in > 0 or iter_amm_out > 0),
+                budget_limited=budget_scaled,
+                limit_quality_floor=limit_floor,
+                fee_pool=fee_pool,
+                fee_tr_in=fee_tr_in,
+                fee_tr_out=fee_tr_out,
+                slippage_price=slippage_price,
+            ))
+            iter_idx += 1
         need = target_out - filled_out
 
         if eff_send_max is not None and spent_in >= eff_send_max:
@@ -253,10 +523,35 @@ def route(target_out: Decimal,
         raise RouteError("deliver_min not met")
 
     avg_quality = (filled_out / spent_in) if spent_in > 0 else Decimal(0)
+
+    # --- Build ExecutionReport for diagnostics ---
+    avg_price = (spent_in / filled_out) if filled_out > 0 else Decimal(0)
+    filled_ratio = (filled_out / target_out) if target_out > 0 else Decimal(0)
+    in_budget_ratio = (spent_in / eff_send_max) if (eff_send_max is not None and eff_send_max > 0) else None
+    fee_pool_total = sum((it.fee_pool for it in iter_records), Decimal(0))
+    fee_tr_in_total = sum((it.fee_tr_in for it in iter_records), Decimal(0))
+    fee_tr_out_total = sum((it.fee_tr_out for it in iter_records), Decimal(0))
+    # Weighted average slippage by OUT volume (avoids division by zero)
+    slippage_price_avg = (sum((it.slippage_price * it.out_filled for it in iter_records), Decimal(0)) / filled_out) if filled_out > 0 else Decimal(0)
+    report = ExecutionReport(
+        iterations=iter_records,
+        total_out=filled_out,
+        total_in=spent_in,
+        avg_price=avg_price,
+        avg_quality=avg_quality,
+        filled_ratio=filled_ratio,
+        in_budget_ratio=in_budget_ratio,
+        fee_pool_total=fee_pool_total,
+        fee_tr_in_total=fee_tr_in_total,
+        fee_tr_out_total=fee_tr_out_total,
+        slippage_price_avg=slippage_price_avg,
+    )
+
     return RouteResult(
         filled_out=filled_out,
         spent_in=spent_in,
         avg_quality=avg_quality,
         usage=usage,
         trace=trace,
+        report=report,
     )
