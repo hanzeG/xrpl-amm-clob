@@ -12,7 +12,7 @@ Rules adopted (impact routing results):
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import List
+from typing import List, Iterable, Optional, Callable
 
 from .core import (
     to_decimal,
@@ -71,7 +71,7 @@ class AMM:
 
     def preview_fees_for_fill(self, dx_gross: Decimal | str | float, dy_net: Decimal | str | float) -> tuple[Decimal, Decimal, Decimal]:
         """Preview fee breakdown for a hypothetical fill without mutating state.
-
+        Inputs are interpreted as non-negative magnitudes; direction/sign is handled by callers.
         Returns (fee_pool, fee_tr_in, fee_tr_out) on the *user* grids, using the same rounding
         conventions as the swap/apply methods where applicable.
         """
@@ -459,3 +459,118 @@ class AMM:
         # Update reserves
         self.x = self.x + dx_to_pool
         self.y = self.y - dy_from_pool
+
+# -----------------------------
+# Public helpers: unified AMM factories for experiments/tests
+# -----------------------------
+
+def amm_curve_from_linear(
+    base_quality: Decimal,
+    slope: Decimal,
+    seg_out: Decimal,
+    *,
+    in_is_xrp: bool = False,
+    out_is_xrp: bool = False,
+) -> Callable[[Decimal], Iterable[Segment]]:
+    """Return an `amm_curve(target_out)` producing AMM segments with mildly degrading quality.
+
+    The instantaneous quality is `q_inst = base_quality - slope * max(target_out, 0)`
+    (clamped to >0). The curve emits fixed-size OUT slices of `seg_out` until it reaches
+    the requested `target_out`, with amounts snapped to the declared grids.
+
+    This is a lightweight convenience for simulations; it does *not* mutate pool state.
+    """
+    if base_quality <= 0:
+        raise ValueError("base_quality must be > 0")
+    if slope < 0:
+        raise ValueError("slope must be ≥ 0")
+    if seg_out <= 0:
+        raise ValueError("seg_out must be > 0")
+
+    def amm_curve(target_out: Decimal) -> Iterable[Segment]:
+        tgt = clamp_nonneg(to_decimal(target_out))
+        if tgt <= 0:
+            return []
+        # Degrade quality with target size (but keep positive)
+        q_inst = base_quality - (slope * tgt)
+        if q_inst <= Decimal("1e-18"):
+            return []
+        out_chunk = round_out_max(seg_out, is_xrp=out_is_xrp)
+        if out_chunk <= 0:
+            return []
+        remain = tgt
+        segs: List[Segment] = []
+        while remain > 0:
+            take = remain if remain <= out_chunk else out_chunk
+            take = round_out_max(take, is_xrp=out_is_xrp)
+            if take <= 0:
+                break
+            # IN needed computed from quality; on IN grid
+            in_need = round_in_min(take / q_inst, is_xrp=in_is_xrp)
+            if in_need <= 0:
+                break
+            q = quality_bucket(calc_quality(take, in_need))
+            if q <= 0:
+                break
+            segs.append(
+                Segment(
+                    src="AMM",
+                    quality=q,
+                    out_max=take,
+                    in_at_out_max=in_need,
+                    in_is_xrp=in_is_xrp,
+                    out_is_xrp=out_is_xrp,
+                )
+            )
+            remain -= take
+        return segs
+
+    return amm_curve
+
+
+def amm_anchor_from_discount(
+    discount: Decimal,
+    *,
+    cap_out: Optional[Decimal] = Decimal("50"),
+    in_is_xrp: bool = False,
+    out_is_xrp: bool = False,
+) -> Callable[[Decimal, Decimal], Optional[Segment]]:
+    """Return an `amm_anchor(q_lob_top, need)` that proposes a single anchored AMM slice.
+
+    Given the current CLOB top quality `q_lob_top`, the anchored slice uses
+    `q = q_lob_top * discount` (i.e., slightly worse than the book top) and
+    size `take = min(need, cap_out)`; amounts are snapped to grids.
+
+    This mirrors the whitepaper's anchoring intuition for AMM vs CLOB coexistence.
+    """
+    if discount <= 0:
+        raise ValueError("discount must be > 0")
+
+    def amm_anchor(q_lob_top: Decimal, need: Decimal) -> Optional[Segment]:
+        q_top = clamp_nonneg(to_decimal(q_lob_top))
+        req = clamp_nonneg(to_decimal(need))
+        if q_top <= 0 or req <= 0:
+            return None
+        q = q_top * discount
+        take = req
+        if cap_out is not None and cap_out > 0 and take > cap_out:
+            take = cap_out
+        take = round_out_max(take, is_xrp=out_is_xrp)
+        if take <= 0:
+            return None
+        in_need = round_in_min(take / q, is_xrp=in_is_xrp)
+        if in_need <= 0:
+            return None
+        q_slice = quality_bucket(calc_quality(take, in_need))
+        if q_slice <= 0:
+            return None
+        return Segment(
+            src="AMM",
+            quality=q_slice,
+            out_max=take,
+            in_at_out_max=in_need,
+            in_is_xrp=in_is_xrp,
+            out_is_xrp=out_is_xrp,
+        )
+
+    return amm_anchor
