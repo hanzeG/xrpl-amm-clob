@@ -52,6 +52,29 @@ qstar = find_crossover_q(segments=clob_segments, amm_anchor=amm_anchor,
                          amm_curve=amm_curve, amm_context=amm_ctx)
 ```
 
+## Development setup
+
+This repository uses a `src/` layout. To run the tests or import `xrpl_router`, install in editable mode:
+
+```bash
+python -m pip install -e .
+```
+
+Alternatively, if you prefer conda, create the environment from `environment.yml`:
+
+```bash
+conda env create -f environment.yml
+conda activate xrpl-amm-clob
+```
+
+Then run the test suite:
+
+```bash
+pytest
+```
+
+Configuration for linting, type checks, and formatting is in `pyproject.toml`.
+
 ## Notes
 - The toolkit focuses on **execution efficiency** (effective prices, slippage, fee breakdowns) rather than empirical data collection. Empirical pipelines can be integrated upstream using the same interfaces.
 - All defaults aim to reflect the whitepaper behaviours (§1.2.7.3, §1.3.2) while remaining tunable via `ROUTING_CFG` for sensitivity analyses.

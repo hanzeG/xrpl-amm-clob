@@ -16,3 +16,11 @@ __pycache__/
 
 # OS-specific
 .DS_Store
+
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.cache/
