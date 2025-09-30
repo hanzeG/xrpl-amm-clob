@@ -30,7 +30,7 @@ class Segment:
     out_is_xrp: bool            # Output asset uses XRP grid (drops)
 
 
-# --- New: Per-iteration and aggregate execution metrics ---
+# --- Per-iteration and aggregate execution metrics ---
 @dataclass(frozen=True)
 class IterationMetrics:
     """Per-iteration execution metrics for efficiency analysis."""
@@ -77,11 +77,12 @@ class RouteResult:
 # -------------------------------
 # Decimal context & constants
 # -------------------------------
+
 DEFAULT_DECIMAL_PRECISION: int = 28
 getcontext().prec = DEFAULT_DECIMAL_PRECISION
 
 # Amount/quality quanta; callers pick based on asset/metric.
-XRP_QUANTUM: Decimal = Decimal("1")         # drops (integer)
+XRP_QUANTUM: Decimal = Decimal("1e-6")      # drops (1e-6 XRP)
 IOU_QUANTUM: Decimal = Decimal("1e-15")     # IOU amounts
 QUALITY_QUANTUM: Decimal = Decimal("1e-15") # quality grid
 DEFAULT_QUANTUM: Decimal = IOU_QUANTUM

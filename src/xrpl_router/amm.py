@@ -404,9 +404,15 @@ class AMM:
 
             # Virtual writeback to shadow reserves (pool-side deltas)
             dx_to_pool = in_need * (one_minus_tr_in if self.tr_in > 0 else one)
-            dy_from_pool = quantize_up(dy_net / one_minus_tr_out, y_quant) if self.tr_out > 0 else dy_net
-            dx_to_pool = round_out_max(dx_to_pool, is_xrp=self.x_is_xrp)
-            dy_from_pool = round_out_max(dy_from_pool, is_xrp=self.y_is_xrp)
+            if self.tr_out > 0:
+                # Gross OUT that must leave the pool so user receives dy_net: quantise up as in apply_fill
+                dy_from_pool = quantize_up(dy_net / one_minus_tr_out, y_quant)
+            else:
+                # No issuer fee on OUT: keep dy_net as-is (already on OUT grid from swap)
+                dy_from_pool = dy_net
+            # Mirror apply_fill: avoid under-credit/debit on the shadow state
+            dx_to_pool = quantize_up(dx_to_pool, x_quant)
+            # dy_from_pool is already on correct grid; do not round it down
             if dy_from_pool >= y_hat:
                 break
             x_hat = x_hat + dx_to_pool
@@ -418,6 +424,37 @@ class AMM:
 
             # Fibonacci growth of slice sizes
             f_prev, f_curr = f_curr, f_prev + f_curr
+
+        # Fallback: if no segments were constructed (e.g., tiny target or adverse quantisation),
+        # attempt to produce a single feasible slice from the *current* state, per whitepaper
+        # AMM-only bootstrap intuition (non-improving, strictly positive amounts on grids).
+        if not segs and remaining > 0:
+            # Start from a conservative OUT try: min(remaining, base). Ensure it's on the OUT grid and < y.
+            dy_try = base if base <= remaining else remaining
+            dy_try = quantize_up(dy_try, y_quant)
+            if dy_try <= 0:
+                dy_try = y_quant
+            if dy_try > 0 and dy_try < self.y:
+                # Compute required IN on current reserves with full fee/grid policy
+                dx_need = _swap_in_given_out_on(self.x, self.y, dy_try)
+                if dx_need > 0:
+                    # Compute achievable OUT back from that IN on current reserves
+                    dy_got = _swap_out_given_in_on(self.x, self.y, dx_need)
+                    if dy_got > 0:
+                        # Cap to requested size for consistency
+                        if dy_got > dy_try:
+                            dy_got = dy_try
+                        q_fb = calc_quality(dy_got, dx_need)
+                        q_fb = quality_bucket(q_fb)
+                        if q_fb > 0:
+                            segs.append(Segment(
+                                src="AMM",
+                                quality=q_fb,
+                                out_max=dy_got,
+                                in_at_out_max=dx_need,
+                                in_is_xrp=self.x_is_xrp,
+                                out_is_xrp=self.y_is_xrp,
+                            ))
 
         return segs
 

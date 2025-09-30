@@ -136,6 +136,14 @@ def route(
     else:
         qmin_bucket = None
 
+    # No-improvement ceiling (whitepaper): later iterations cannot exceed the *effective* quality of prior iterations
+    # Keep both raw (unbucketed) and bucketed trackers: use RAW for enforcement to avoid bucket-leak improvements.
+    qmax_ceiling_raw: Optional[Decimal] = None
+    qmax_ceiling_bucket: Optional[Decimal] = None
+
+    # Enforce whitepaper no-improvement at the level of effective marginal price per iteration
+    price_floor_raw: Optional[Decimal] = None  # minimum allowed effective price for subsequent iterations
+
     while need > 0:
         # If no segments are available at the start of an iteration, try sourcing from AMM curve
         if (not segs) and (amm_curve is not None):
@@ -223,6 +231,9 @@ def route(
             iter_segs.extend(curve_segs)
 
         _ensure_order_for_list(iter_segs)
+
+        # No pre-filtering by "quality ceiling": we enforce no-improvement via an effective-price floor
+        # applied after grid rounding at the iteration level (see below).
 
         # Apply per-iteration quality floor if requested
         if qmin_bucket is not None:
@@ -378,9 +389,34 @@ def route(
             iter_out_sum = sum(flo_out)
             iter_in_sum = sum(flo_in)
             iter_price_eff = (iter_in_sum / iter_out_sum) if iter_out_sum > 0 else Decimal(0)
-            # Baseline price for slippage: inverse of the tier quality bucket
-            baseline_price = (Decimal(1) / current_tier_bucket) if current_tier_bucket > 0 else Decimal(0)
-            slippage_price = (iter_price_eff - baseline_price) if baseline_price > 0 else Decimal(0)
+
+            # Enforce per-iteration effective-price floor (no-improvement):
+            # If the current effective price is cheaper than the previous iteration, raise IN just enough
+            # (respecting the IN grid) to meet the floor. This preserves proportional OUTs and avoids
+            # bucket-boundary leakage.
+            if price_floor_raw is not None and iter_out_sum > 0 and iter_price_eff < price_floor_raw:
+                in_is_xrp_tier = any(s.in_is_xrp for s in tier)
+                target_in = round_in_min(iter_out_sum * price_floor_raw, is_xrp=in_is_xrp_tier)
+                add_in = target_in - iter_in_sum
+                if add_in > 0:
+                    # Attribute the additional IN to the first filled slice (AMM or CLOB). This increases price
+                    # without changing OUT, and cannot violate instantaneous-quality guards (we're making it worse).
+                    for idx in range(len(flo_in)):
+                        if flo_out[idx] > 0:
+                            flo_in[idx] += add_in
+                            break
+                    iter_in_sum = sum(flo_in)
+                    iter_price_eff = (iter_in_sum / iter_out_sum) if iter_out_sum > 0 else Decimal(0)
+
+            # Baseline price for slippage at this tier, aligned to ledger rounding (computed AFTER enforcing floor)
+            if current_tier_bucket > 0 and iter_out_sum > 0:
+                in_is_xrp_tier = any(s.in_is_xrp for s in tier)
+                baseline_in_guarded = round_in_min(iter_out_sum / current_tier_bucket, is_xrp=in_is_xrp_tier)
+                baseline_price = baseline_in_guarded / iter_out_sum
+                slippage_price = iter_price_eff - baseline_price
+            else:
+                baseline_price = Decimal(0)
+                slippage_price = Decimal(0)
             # Fee components (pool fee and issuer transfer fees) are AMM-specific and require
             # pool parameters; keep placeholders here. They can be populated by higher-level
             # wrappers that know the concrete AMM instance.
@@ -456,6 +492,16 @@ def route(
                         if ctx.multi_path:
                             ctx.advance_fib()
                     after_iteration(iter_amm_in, iter_amm_out)
+                # Update no-improvement ceiling to this iteration's effective quality
+                if iter_in_sum > 0 and iter_out_sum > 0:
+                    q_eff_raw = (iter_out_sum / iter_in_sum)
+                    q_eff_bucket = quality_bucket(q_eff_raw)
+                    qmax_ceiling_raw = (
+                        q_eff_raw if qmax_ceiling_raw is None else min(qmax_ceiling_raw, q_eff_raw)
+                    )
+                    qmax_ceiling_bucket = (
+                        q_eff_bucket if qmax_ceiling_bucket is None else min(qmax_ceiling_bucket, q_eff_bucket)
+                    )
                 # Append per-iteration metrics (complete fill)
                 iter_records.append(IterationMetrics(
                     iter_index=iter_idx,
@@ -472,6 +518,9 @@ def route(
                     slippage_price=slippage_price,
                 ))
                 iter_idx += 1
+                # Set/update floor for subsequent iterations
+                if iter_out_sum > 0:
+                    price_floor_raw = iter_price_eff
                 break
         else:
             # Nothing to do in this tier
@@ -491,6 +540,16 @@ def route(
             after_iteration(iter_amm_in, iter_amm_out)
         # Append per-iteration metrics (normal continue)
         if need > 0 and tier:
+            # Update no-improvement ceiling to this iteration's effective quality
+            if iter_in_sum > 0 and iter_out_sum > 0:
+                q_eff_raw = (iter_out_sum / iter_in_sum)
+                q_eff_bucket = quality_bucket(q_eff_raw)
+                qmax_ceiling_raw = (
+                    q_eff_raw if qmax_ceiling_raw is None else min(qmax_ceiling_raw, q_eff_raw)
+                )
+                qmax_ceiling_bucket = (
+                    q_eff_bucket if qmax_ceiling_bucket is None else min(qmax_ceiling_bucket, q_eff_bucket)
+                )
             iter_records.append(IterationMetrics(
                 iter_index=iter_idx,
                 tier_quality=current_tier_bucket,
@@ -506,6 +565,9 @@ def route(
                 slippage_price=slippage_price,
             ))
             iter_idx += 1
+            # Set/update floor for subsequent iterations
+            if iter_out_sum > 0:
+                price_floor_raw = iter_price_eff
         need = target_out - filled_out
 
         if eff_send_max is not None and spent_in >= eff_send_max:
@@ -523,8 +585,10 @@ def route(
     fee_pool_total = sum((it.fee_pool for it in iter_records), Decimal(0))
     fee_tr_in_total = sum((it.fee_tr_in for it in iter_records), Decimal(0))
     fee_tr_out_total = sum((it.fee_tr_out for it in iter_records), Decimal(0))
-    # Weighted average slippage by OUT volume (avoids division by zero)
-    slippage_price_avg = (sum((it.slippage_price * it.out_filled for it in iter_records), Decimal(0)) / filled_out) if filled_out > 0 else Decimal(0)
+    # OUT-weighted average slippage (whitepaper semantics: aggregate over filled quantity)
+    slip_num = sum((it.slippage_price * it.out_filled) for it in iter_records)
+    slip_den = sum((it.out_filled) for it in iter_records)
+    slippage_price_avg = (slip_num / slip_den) if slip_den > 0 else Decimal(0)
     report = ExecutionReport(
         iterations=iter_records,
         total_out=filled_out,
