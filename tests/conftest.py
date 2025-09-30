@@ -1,3 +1,4 @@
+from __future__ import annotations
 import math
 from decimal import Decimal
 from typing import Callable, Iterable, List, Optional, Tuple
@@ -5,110 +6,15 @@ from typing import Callable, Iterable, List, Optional, Tuple
 import pytest
 
 # Import project primitives
-from xrpl_router.core import Segment, IOU_QUANTUM, round_in_min
+from xrpl_router.core import Segment
 from xrpl_router.amm_context import AMMContext
+from xrpl_router.clob import make_ladder, normalise_segments
+from xrpl_router.amm import amm_curve_from_linear, amm_anchor_from_discount
 
 
 # -----------------------------
 # Test helpers (pure functions)
 # -----------------------------
-
-def make_clob_segments(
-    *,
-    depth: int = 5,
-    top_quality: Decimal = Decimal("1.00"),
-    qty_per_level: Decimal = Decimal("50"),
-    decay: Decimal = Decimal("0.98"),
-) -> List[Segment]:
-    """Create a synthetic CLOB ladder with monotonically degrading quality.
-
-    quality = OUT/IN (higher is better / cheaper). Each level reduces quality by `decay` factor.
-    Each level provides `qty_per_level` OUT units.
-    """
-    segs: List[Segment] = []
-    q = top_quality
-    for _ in range(depth):
-        out_max = qty_per_level
-        # IN needed = OUT / quality
-        in_need = (out_max / q) if q > 0 else Decimal("Infinity")
-        in_need = round_in_min(in_need, is_xrp=False)
-        segs.append(
-            Segment(
-                src="CLOB",
-                quality=q,
-                out_max=out_max,
-                in_at_out_max=in_need,
-                in_is_xrp=False,
-                out_is_xrp=False,
-            )
-        )
-        q = (q * decay)
-        if q <= 0:
-            break
-    return segs
-
-
-def amm_curve_stub_factory(
-    *,
-    base_quality: Decimal = Decimal("0.99"),
-    slope: Decimal = Decimal("0.0001"),
-    seg_out: Decimal = Decimal("25"),
-) -> Callable[[Decimal], Iterable[Segment]]:
-    """Return an `amm_curve(target_out)` function producing one or more AMM segments.
-
-    The instantaneous quality starts around `base_quality` and degrades slightly with
-    requested OUT via a simple linear model (only for testing determinism).
-    """
-    def amm_curve(target_out: Decimal) -> Iterable[Segment]:
-        # Degrade quality mildly with target size; keep positive
-        q_inst = base_quality - (slope * max(target_out, Decimal(0)))
-        if q_inst <= Decimal("0.000001"):
-            return []
-        # Provide a few fixed-size slices so router can iterate
-        remain = target_out
-        segs: List[Segment] = []
-        while remain > 0:
-            take = min(seg_out, remain)
-            in_need = round_in_min(take / q_inst, is_xrp=False)
-            segs.append(
-                Segment(
-                    src="AMM",
-                    quality=q_inst,
-                    out_max=take,
-                    in_at_out_max=in_need,
-                    in_is_xrp=False,
-                    out_is_xrp=False,
-                )
-            )
-            remain -= take
-        return segs
-
-    return amm_curve
-
-
-def amm_anchor_stub_factory(
-    *,
-    discount: Decimal = Decimal("0.995"),
-) -> Callable[[Decimal, Decimal], Optional[Segment]]:
-    """Return an `amm_anchor(q_lob_top, need)` that proposes a single AMM slice
-    anchored to the current CLOB top quality with a small discount (worse than top).
-    """
-    def amm_anchor(q_lob_top: Decimal, need: Decimal) -> Optional[Segment]:
-        if q_lob_top <= 0 or need <= 0:
-            return None
-        q = q_lob_top * discount  # slightly worse than the book top
-        take = min(need, Decimal("50"))
-        in_need = round_in_min(take / q, is_xrp=False)
-        return Segment(
-            src="AMM",
-            quality=q,
-            out_max=take,
-            in_at_out_max=in_need,
-            in_is_xrp=False,
-            out_is_xrp=False,
-        )
-
-    return amm_anchor
 
 
 class FakeAMM:
@@ -148,17 +54,17 @@ def amm_ctx_multipath() -> AMMContext:
 
 @pytest.fixture()
 def clob_segments_default() -> List[Segment]:
-    return make_clob_segments(depth=6, top_quality=Decimal("1.00"), qty_per_level=Decimal("40"), decay=Decimal("0.985"))
+    return normalise_segments(make_ladder(depth=6, top_quality=Decimal("1.00"), qty_per_level=Decimal("40"), decay=Decimal("0.985")))
 
 
 @pytest.fixture()
 def amm_curve_default() -> Callable[[Decimal], Iterable[Segment]]:
-    return amm_curve_stub_factory(base_quality=Decimal("0.99"), slope=Decimal("0.00005"), seg_out=Decimal("20"))
+    return amm_curve_from_linear(base_quality=Decimal("0.99"), slope=Decimal("0.00005"), seg_out=Decimal("20"))
 
 
 @pytest.fixture()
 def amm_anchor_default() -> Callable[[Decimal, Decimal], Optional[Segment]]:
-    return amm_anchor_stub_factory(discount=Decimal("0.995"))
+    return amm_anchor_from_discount(discount=Decimal("0.995"))
 
 
 @pytest.fixture()

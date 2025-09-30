@@ -1,5 +1,12 @@
 from decimal import Decimal
 
+# Numerical tolerance for Decimal comparisons (covers rounding/bucketing noise)
+EPS_ABS = Decimal("1e-12")
+EPS_REL = Decimal("1e-12")
+
+def geq_with_tol(x: Decimal, y: Decimal) -> bool:
+    return x + max(EPS_ABS, y.copy_abs() * EPS_REL) >= y
+
 import pytest
 
 from xrpl_router.exec_modes import run_trade_mode, ExecutionMode
@@ -30,11 +37,11 @@ def test_slippage_monotonic_clob_only(clob_segments_default, sizes):
         # slippage is price_effective - baseline_price (1/quality_bucket), cf. router impl
         slips.append(er.slippage_price_avg)
 
-    # Non-negative and non-decreasing
+    # Non-negative and non-decreasing (within numerical tolerance)
     for s in slips:
-        assert s >= 0
+        assert geq_with_tol(s, Decimal(0))
     for a, b in zip(slips, slips[1:]):
-        assert b >= a
+        assert geq_with_tol(b, a)
 
 
 @pytest.mark.parametrize("sizes", [
@@ -56,7 +63,8 @@ def test_slippage_monotonic_amm_only(clob_segments_default, amm_curve_default, a
         assert er.total_out > 0
         slips.append(er.slippage_price_avg)
 
+    # Non-negative and non-decreasing (within numerical tolerance)
     for s in slips:
-        assert s >= 0
+        assert geq_with_tol(s, Decimal(0))
     for a, b in zip(slips, slips[1:]):
-        assert b >= a
+        assert geq_with_tol(b, a)

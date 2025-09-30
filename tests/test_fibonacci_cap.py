@@ -8,11 +8,8 @@ from xrpl_router.efficiency_scan import hybrid_flow
 from xrpl_router.amm_context import AMMContext
 from xrpl_router.core import Segment
 
-from .conftest import (
-    make_clob_segments,
-    amm_curve_stub_factory,
-    amm_anchor_stub_factory,
-)
+from xrpl_router.clob import make_ladder, normalise_segments
+from xrpl_router.amm import amm_curve_from_linear, amm_anchor_from_discount
 
 
 # ---------------------------
@@ -31,10 +28,10 @@ def test_fib_not_advance_when_amm_unused():
     ctx.set_multi_path(True)
 
     # CLOB: high quality, enough to cover the target fully
-    clob = make_clob_segments(depth=3, top_quality=Decimal("1.00"), qty_per_level=Decimal("40"), decay=Decimal("0.99"))
+    clob = normalise_segments(make_ladder(depth=3, top_quality=Decimal("1.00"), qty_per_level=Decimal("40"), decay=Decimal("0.99")))
     # AMM: slightly worse than book, so it won't be selected
-    amm_curve = amm_curve_stub_factory(base_quality=Decimal("0.98"), slope=Decimal("0.0"), seg_out=Decimal("20"))
-    amm_anchor = amm_anchor_stub_factory(discount=Decimal("0.98"))
+    amm_curve = amm_curve_from_linear(base_quality=Decimal("0.98"), slope=Decimal("0.0"), seg_out=Decimal("20"))
+    amm_anchor = amm_anchor_from_discount(discount=Decimal("0.98"))
 
     # Run once: full fill from CLOB
     res = hybrid_flow(
@@ -62,9 +59,9 @@ def test_fib_advances_when_amm_used():
     ctx.set_multi_path(True)
 
     # Step 1: CLOB-only behaviour to initialise base without advancing
-    clob = make_clob_segments(depth=3, top_quality=Decimal("1.00"), qty_per_level=Decimal("40"), decay=Decimal("0.99"))
-    amm_curve_worse = amm_curve_stub_factory(base_quality=Decimal("0.98"), slope=Decimal("0.0"), seg_out=Decimal("20"))
-    amm_anchor_worse = amm_anchor_stub_factory(discount=Decimal("0.98"))
+    clob = normalise_segments(make_ladder(depth=3, top_quality=Decimal("1.00"), qty_per_level=Decimal("40"), decay=Decimal("0.99")))
+    amm_curve_worse = amm_curve_from_linear(base_quality=Decimal("0.98"), slope=Decimal("0.0"), seg_out=Decimal("20"))
+    amm_anchor_worse = amm_anchor_from_discount(discount=Decimal("0.98"))
 
     hybrid_flow(
         target_out=Decimal("40"),
@@ -76,7 +73,7 @@ def test_fib_advances_when_amm_used():
     base = ctx._fib_curr
 
     # Step 2: Force AMM-only so AMM is used and Fibonacci advances
-    amm_curve = amm_curve_stub_factory(base_quality=Decimal("0.99"), slope=Decimal("0.0"), seg_out=Decimal("10"))
+    amm_curve = amm_curve_from_linear(base_quality=Decimal("0.99"), slope=Decimal("0.0"), seg_out=Decimal("10"))
     hybrid_flow(
         target_out=Decimal("30"),
         clob_segments=[],
@@ -98,7 +95,7 @@ def test_amm_iteration_cap_stops_at_30():
     ctx = AMMContext(False)
     ctx.set_multi_path(True)
 
-    amm_curve = amm_curve_stub_factory(base_quality=Decimal("0.99"), slope=Decimal("0.0"), seg_out=Decimal("5"))
+    amm_curve = amm_curve_from_linear(base_quality=Decimal("0.99"), slope=Decimal("0.0"), seg_out=Decimal("5"))
 
     # Drive AMM participation repeatedly until we hit the cap (safety loop ≤ 200)
     loops = 0

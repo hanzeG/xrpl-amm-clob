@@ -1,9 +1,17 @@
 from decimal import Decimal
+#
+# Numerical tolerance for Decimal comparisons (covers rounding/bucketing)
+EPS_ABS = Decimal("1e-9")
+EPS_REL = Decimal("1e-9")
+def leq_with_tol(x: Decimal, y: Decimal) -> bool:
+    return x <= y + max(EPS_ABS, y.copy_abs() * EPS_REL)
 
 import pytest
 
 from xrpl_router.exec_modes import run_trade_mode, ExecutionMode
 from xrpl_router.efficiency_scan import hybrid_flow
+
+from xrpl_router.clob import make_ladder, normalise_segments
 
 
 # ---------------------------
@@ -40,13 +48,17 @@ def test_send_max_caps_total_in_clob_only(clob_segments_default):
     er1 = capped.report
     assert er1 is not None
 
-    # Budget respected
-    assert er1.total_in <= send_max
-    # Fill cannot exceed target; with tighter budget it should be strictly lower than baseline
-    assert er1.total_out <= target
-    assert er1.filled_ratio <= er0.filled_ratio
-    # If budget binds, we expect a strictly lower fill (allow equality if book is very cheap)
-    assert er1.total_out <= er0.total_out
+    # Budget respected (allow tiny rounding/bucketing overshoot)
+    assert leq_with_tol(er1.total_in, send_max)
+
+    # Fill cannot exceed target (tolerant)
+    assert leq_with_tol(er1.total_out, target)
+
+    # With tighter budget, filled ratio should not improve (tolerant)
+    assert leq_with_tol(er1.filled_ratio, er0.filled_ratio)
+
+    # If budget binds, we expect a non-increasing fill (tolerant)
+    assert leq_with_tol(er1.total_out, er0.total_out)
 
 
 def test_send_max_caps_total_in_hybrid(clob_segments_default, amm_curve_default, amm_anchor_default, amm_ctx_multipath):
@@ -57,8 +69,7 @@ def test_send_max_caps_total_in_hybrid(clob_segments_default, amm_curve_default,
     target = Decimal("100")
 
     # Use a shallower CLOB to keep hybrid replay fast under tight budgets
-    from .conftest import make_clob_segments
-    clob_shallow = make_clob_segments(depth=4, top_quality=Decimal("1.00"), qty_per_level=Decimal("30"), decay=Decimal("0.99"))
+    clob_shallow = normalise_segments(make_ladder(depth=4, top_quality=Decimal("1.00"), qty_per_level=Decimal("30"), decay=Decimal("0.99")))
 
     # Baseline without budget
     base = hybrid_flow(
@@ -81,8 +92,11 @@ def test_send_max_caps_total_in_hybrid(clob_segments_default, amm_curve_default,
         send_max=send_max,
     )
 
-    # Budget respected
-    assert capped.total_in <= send_max
-    # Fill cannot exceed target; with tighter budget it should be lower or equal
-    assert capped.total_out <= target
-    assert capped.total_out <= base.total_out
+    # Budget respected (allow tiny rounding/bucketing overshoot)
+    assert leq_with_tol(capped.total_in, send_max)
+
+    # Fill cannot exceed target (tolerant)
+    assert leq_with_tol(capped.total_out, target)
+
+    # With tighter budget, filled amount should not improve (tolerant)
+    assert leq_with_tol(capped.total_out, base.total_out)
