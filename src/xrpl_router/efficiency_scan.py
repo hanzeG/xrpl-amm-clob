@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable, List, Optional, Callable, Sequence, Tuple, Dict
 
+
 from .core import Segment, RouteResult, ExecutionReport, ROUTING_CFG
 from .exec_modes import run_trade_mode, ExecutionMode
 # Hybrid flow/step imports
@@ -12,6 +13,11 @@ from .amm import AMM
 # Hybrid flow/step imports
 from .flow import PaymentSandbox, flow
 from .steps import Step, BookStepAdapter
+
+# Upper bound target used when enforcing an *input* cap in Step.fwd()
+# We request a very large OUT and let send_max cap the actual spend,
+# avoiding unit-mismatch when flow() passes an IN cap to fwd().
+BIG_Q_OUT = Decimal("1e12")
 
 
 @dataclass(frozen=True)
@@ -102,6 +108,31 @@ def _with_fee_totals(rr: RouteResult,
         usage=rr.usage,
         trace=rr.trace,
         report=new_er,
+    )
+
+# --- Small helper to construct a zero RouteResult (used when a leg has q==0) ---
+
+def _zero_route_result() -> RouteResult:
+    er = ExecutionReport(
+        iterations=0,
+        total_out=Decimal(0),
+        total_in=Decimal(0),
+        avg_price=Decimal(0),
+        avg_quality=Decimal(0),
+        filled_ratio=Decimal(0),
+        in_budget_ratio=Decimal(0),
+        fee_pool_total=Decimal(0),
+        fee_tr_in_total=Decimal(0),
+        fee_tr_out_total=Decimal(0),
+        slippage_price_avg=Decimal(0),
+    )
+    return RouteResult(
+        filled_out=Decimal(0),
+        spent_in=Decimal(0),
+        avg_quality=Decimal(0),
+        usage=[],
+        trace=[],
+        report=er,
     )
 
 
@@ -216,39 +247,46 @@ def analyze_alpha_scan(
         send_max_amm, send_max_clob = _split_budget(send_max, a)
         deliver_min_amm, deliver_min_clob = _split_budget(deliver_min, a)
 
-        # AMM-only leg
-        fee_meter: Dict[str, Decimal] = {}
-        res_amm = run_trade_mode(
-            ExecutionMode.AMM_ONLY,
-            target_out=q_amm,
-            segments=segs_list,  # ignored by AMM_ONLY
-            send_max=send_max_amm,
-            deliver_min=deliver_min_amm,
-            limit_quality=None,
-            amm_anchor=amm_anchor,
-            amm_curve=amm_curve,
-            amm_context=amm_context,
-            apply_sink=_wrap_apply_sink_with_fee_meter(amm_for_fees, None, fee_meter),
-        )
-        # Attach fee totals into AMM leg's report if available
-        res_amm = _with_fee_totals(
-            res_amm,
-            fee_pool_total=fee_meter.get('fee_pool', Decimal(0)),
-            fee_tr_in_total=fee_meter.get('fee_tr_in', Decimal(0)),
-            fee_tr_out_total=fee_meter.get('fee_tr_out', Decimal(0)),
-        )
-        # CLOB-only leg
-        res_clob = run_trade_mode(
-            ExecutionMode.CLOB_ONLY,
-            target_out=q_clob,
-            segments=segs_list,
-            send_max=send_max_clob,
-            deliver_min=deliver_min_clob,
-            limit_quality=None,
-            amm_anchor=amm_anchor,  # ignored by CLOB_ONLY
-            amm_curve=amm_curve,    # ignored by CLOB_ONLY
-            amm_context=amm_context,
-        )
+        # AMM-only leg (skip when q_amm == 0 to avoid routing with target_out=0)
+        if q_amm > 0:
+            fee_meter: Dict[str, Decimal] = {}
+            res_amm = run_trade_mode(
+                ExecutionMode.AMM_ONLY,
+                target_out=q_amm,
+                segments=segs_list,  # ignored by AMM_ONLY
+                send_max=send_max_amm,
+                deliver_min=deliver_min_amm,
+                limit_quality=None,
+                amm_anchor=amm_anchor,
+                amm_curve=amm_curve,
+                amm_context=amm_context,
+                apply_sink=_wrap_apply_sink_with_fee_meter(amm_for_fees, None, fee_meter),
+            )
+            # Attach fee totals into AMM leg's report if available
+            res_amm = _with_fee_totals(
+                res_amm,
+                fee_pool_total=fee_meter.get('fee_pool', Decimal(0)),
+                fee_tr_in_total=fee_meter.get('fee_tr_in', Decimal(0)),
+                fee_tr_out_total=fee_meter.get('fee_tr_out', Decimal(0)),
+            )
+        else:
+            res_amm = _zero_route_result()
+
+        # CLOB-only leg (skip when q_clob == 0)
+        if q_clob > 0:
+            res_clob = run_trade_mode(
+                ExecutionMode.CLOB_ONLY,
+                target_out=q_clob,
+                segments=segs_list,
+                send_max=send_max_clob,
+                deliver_min=deliver_min_clob,
+                limit_quality=None,
+                amm_anchor=amm_anchor,  # ignored by CLOB_ONLY
+                amm_curve=amm_curve,    # ignored by CLOB_ONLY
+                amm_context=amm_context,
+            )
+        else:
+            res_clob = _zero_route_result()
 
         out_total = res_amm.filled_out + res_clob.filled_out
         in_total = res_amm.spent_in + res_clob.spent_in
@@ -416,6 +454,9 @@ __all__ = [
     "HybridVsAlpha",
     "compare_hybrid_vs_alpha",
     "BatchRow", "batch_analyze", "batch_rows_to_csv",
+    "summarize_hybrid",
+    "summarize_alpha_scan",
+    "summarize_crossover",
 ]
 
 
@@ -447,7 +488,10 @@ def _wrap_apply_sink_with_fee_meter(amm: AMM | None,
         return None
     def wrapped(dx: Decimal, dy: Decimal) -> None:
         if amm is not None:
-            fp, fi, fo = amm.preview_fees_for_fill(dx, dy)
+            # Pass non-negative magnitudes to the AMM fee preview to avoid sign/rounding artefacts
+            dx_abs = dx.copy_abs() if hasattr(dx, 'copy_abs') else (dx if dx >= 0 else -dx)
+            dy_abs = dy.copy_abs() if hasattr(dy, 'copy_abs') else (dy if dy >= 0 else -dy)
+            fp, fi, fo = amm.preview_fees_for_fill(dx_abs, dy_abs)
             fee_meter['fee_pool'] = fee_meter.get('fee_pool', Decimal(0)) + fp
             fee_meter['fee_tr_in'] = fee_meter.get('fee_tr_in', Decimal(0)) + fi
             fee_meter['fee_tr_out'] = fee_meter.get('fee_tr_out', Decimal(0)) + fo
@@ -462,20 +506,35 @@ class _ClobStepForHybrid(Step):
                  segments_provider: Callable[[], Iterable[Segment]],
                  *,
                  limit_quality: Optional[Decimal] = None,
-                 meter: dict):
+                 meter: dict,
+                 clob_cap: Optional[Decimal] = None):
         self._segments_provider = segments_provider
         self._limit_quality = limit_quality
         self._meter = meter
+        self._clob_cap = clob_cap
         self._cached_in = Decimal(0)
         self._cached_out = Decimal(0)
 
     def quality_upper_bound(self) -> Decimal:
+        # If this hybrid run has exhausted CLOB capacity, make this leg unavailable
+        if self._clob_cap is not None:
+            used = self._meter.get('clob_out', Decimal(0))
+            if used >= self._clob_cap:
+                return Decimal(0)
         segs = list(self._segments_provider())
         if not segs:
             return Decimal(0)
         return max(s.quality for s in segs)
 
     def rev(self, sandbox: PaymentSandbox, out_req: Decimal):
+        # Cap reverse request by remaining CLOB capacity observed in this hybrid run
+        if self._clob_cap is not None:
+            used = self._meter.get('clob_out', Decimal(0))
+            remain_cap = self._clob_cap - used
+            if remain_cap <= 0:
+                self._cached_in, self._cached_out = Decimal(0), Decimal(0)
+                return self._cached_in, self._cached_out
+            out_req = out_req if out_req <= remain_cap else remain_cap
         # Reverse pass: dry-run router without AMM hooks and without writebacks
         segs = list(self._segments_provider())
         res = run_trade_mode(
@@ -492,10 +551,26 @@ class _ClobStepForHybrid(Step):
 
     def fwd(self, sandbox: PaymentSandbox, in_cap: Decimal):
         segs = list(self._segments_provider())
+        # Cap forward request by remaining CLOB capacity in this hybrid run
+        tgt_out = BIG_Q_OUT
+        if self._clob_cap is not None:
+            used = self._meter.get('clob_out', Decimal(0))
+            remain_cap = self._clob_cap - used
+            if remain_cap <= 0:
+                self._cached_in, self._cached_out = Decimal(0), Decimal(0)
+                # still return zero contribution
+                self._meter.setdefault('clob_out', Decimal(0))
+                return self._cached_in, self._cached_out
+            if tgt_out > remain_cap:
+                tgt_out = remain_cap
+        # flow.fwd passes an *input* cap here. Router expects a target_out.
+        # To avoid unit mismatch, we request a very large OUT and rely on send_max=in_cap
+        # to cap the actual spend. This collapses the per-step forward replay correctly.
         res = run_trade_mode(
             ExecutionMode.CLOB_ONLY,
-            target_out=in_cap,   # BookStepAdapter collapses; here we mirror cap-as-target
+            target_out=tgt_out,
             segments=segs,
+            send_max=in_cap,
             limit_quality=self._limit_quality,
             amm_anchor=None,
             amm_curve=None,
@@ -521,6 +596,7 @@ class _AmmStepForHybrid(Step):
                  amm_context: Optional[AMMContext] = None,
                  limit_quality: Optional[Decimal] = None,
                  probe: Decimal = Decimal("1"),
+                 apply_sink: Optional[Callable[[Decimal, Decimal], None]] = None,
                  meter: dict):
         self._amm_anchor = amm_anchor
         self._amm_curve = amm_curve
@@ -528,10 +604,14 @@ class _AmmStepForHybrid(Step):
         self._limit_quality = limit_quality
         self._probe = probe
         self._meter = meter
+        self._apply_sink = apply_sink
         self._cached_in = Decimal(0)
         self._cached_out = Decimal(0)
 
     def quality_upper_bound(self) -> Decimal:
+        # If AMM iteration cap is reached, this leg should be unavailable
+        if self._amm_context is not None and self._amm_context.max_iters_reached():
+            return Decimal(0)
         if self._amm_curve is None:
             return Decimal(0)
         try:
@@ -541,9 +621,20 @@ class _AmmStepForHybrid(Step):
         segs = [s for s in segs if s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0]
         if not segs:
             return Decimal(0)
+        # Lazy-initialise Fibonacci base in AMMContext (whitepaper §1.2.7.3):
+        # calling current_fib_cap(base) will initialise if not yet inited, without advancing.
+        if self._amm_context is not None:
+            try:
+                self._amm_context.current_fib_cap(self._probe)
+            except Exception:
+                pass
         return max(s.quality for s in segs)
 
     def rev(self, sandbox: PaymentSandbox, out_req: Decimal):
+        # Do not simulate AMM leg if cap reached
+        if self._amm_context is not None and self._amm_context.max_iters_reached():
+            self._cached_in, self._cached_out = Decimal(0), Decimal(0)
+            return self._cached_in, self._cached_out
         # Reverse pass: AMM-only, bootstrap via amm_curve inside router; no writebacks
         res = run_trade_mode(
             ExecutionMode.AMM_ONLY,
@@ -552,25 +643,59 @@ class _AmmStepForHybrid(Step):
             limit_quality=self._limit_quality,
             amm_anchor=self._amm_anchor,
             amm_curve=self._amm_curve,
-            amm_context=self._amm_context,
+            amm_context=None,  # Do not mutate shared AMMContext during reverse pass
         )
         self._cached_in, self._cached_out = res.spent_in, res.filled_out
         return self._cached_in, self._cached_out
 
     def fwd(self, sandbox: PaymentSandbox, in_cap: Decimal):
+        # If cap already reached, AMM must not contribute this iteration
+        if self._amm_context is not None and self._amm_context.max_iters_reached():
+            self._cached_in, self._cached_out = Decimal(0), Decimal(0)
+            # Ensure meter records zero contribution
+            self._meter.setdefault('amm_out', Decimal(0))
+            return self._cached_in, self._cached_out
+        # flow.fwd passes an *input* cap here. Router expects a target_out.
+        # Derive a reasonable OUT target using a conservative quality estimate to avoid
+        # generating an excessively large number of AMM segments. Still pass send_max=in_cap
+        # so the true spend is budget-capped.
+        try:
+            q_est = self.quality_upper_bound()
+        except Exception:
+            q_est = Decimal(0)
+        if q_est <= 0:
+            q_est = Decimal("1")  # fallback to 1:1 to keep target bounded
+        # Bound requested OUT by both a heuristic estimate and a hard ceiling
+        tgt_out = in_cap * q_est * Decimal("1.5")  # small safety factor
+        if tgt_out <= 0:
+            tgt_out = Decimal("1")
+        if tgt_out > BIG_Q_OUT:
+            tgt_out = BIG_Q_OUT
+
         res = run_trade_mode(
             ExecutionMode.AMM_ONLY,
-            target_out=in_cap,
+            target_out=tgt_out,
             segments=[],
+            send_max=in_cap,
             limit_quality=self._limit_quality,
             amm_anchor=self._amm_anchor,
             amm_curve=self._amm_curve,
             amm_context=self._amm_context,
+            apply_sink=self._apply_sink,
         )
         self._cached_in, self._cached_out = res.spent_in, res.filled_out
         # Track contribution
         self._meter.setdefault('amm_out', Decimal(0))
         self._meter['amm_out'] += self._cached_out
+        # Advance AMM usage + Fibonacci cap only when AMM actually contributed this iteration
+        if self._amm_context is not None and self._cached_out > 0:
+            # Ensure Fibonacci is initialised (no-op if already inited)
+            try:
+                self._amm_context.current_fib_cap(self._probe)
+            except Exception:
+                pass
+            self._amm_context.mark_amm_used_this_iter()
+            self._amm_context.advance_fib()
         return self._cached_in, self._cached_out
 
 
@@ -599,9 +724,14 @@ def hybrid_flow(
     sb = PaymentSandbox()
     ctx = amm_context or AMMContext(False)
     ctx.set_multi_path(True)
+    # Snapshot AMM usage iterations to restore if AMM leg remains unused
+    prev_amm_used_iters = ctx.amm_used_iters
 
-    clob_step = _ClobStepForHybrid(lambda: segs_list, limit_quality=limit_quality, meter=meter)
-    amm_step = _AmmStepForHybrid(amm_anchor, amm_curve, amm_context=ctx, limit_quality=limit_quality, meter=meter)
+    wrapped_apply = _wrap_apply_sink_with_fee_meter(amm_for_fees, apply_sink, fee_meter)
+    # Per-run CLOB capacity (sum of declared out_max); used to prevent reusing the book across iterations
+    clob_cap = sum((s.out_max for s in segs_list if s.src == "CLOB"), Decimal(0))
+    clob_step = _ClobStepForHybrid(lambda: segs_list, limit_quality=limit_quality, meter=meter, clob_cap=clob_cap)
+    amm_step = _AmmStepForHybrid(amm_anchor, amm_curve, amm_context=ctx, limit_quality=limit_quality, meter=meter, apply_sink=wrapped_apply)
 
     total_in, total_out = flow(
         sb,
@@ -610,8 +740,13 @@ def hybrid_flow(
         send_max=send_max,
         limit_quality=limit_quality,
         amm_context=ctx,
-        apply_sink=_wrap_apply_sink_with_fee_meter(amm_for_fees, apply_sink, fee_meter),
+        apply_sink=wrapped_apply,
     )
+
+    # If AMM contributed zero OUT in this run, do not advance AMM-used iteration counter
+    if meter.get('amm_out', Decimal(0)) <= 0:
+        # Restore to snapshot to counter any unintended increments from dry runs
+        ctx._amm_used_iters = prev_amm_used_iters  # internal field, safe within repo
 
     amm_out = meter.get('amm_out', Decimal(0))
     alpha_obs = (amm_out / total_out) if total_out > 0 else Decimal(0)
@@ -798,3 +933,94 @@ def batch_rows_to_csv(rows: Sequence[BatchRow]) -> str:
             ])
         )
     return "\n".join(lines)
+
+
+# ---------------- Unified reporting helpers (whitepaper: execution efficiency decomposition) ----------------
+
+def _fee_totals_from_report(rr: RouteResult) -> Tuple[Decimal, Decimal, Decimal]:
+    """Safely extract fee totals from a RouteResult's report (zeros if absent)."""
+    er = rr.report
+    if er is None:
+        return (Decimal(0), Decimal(0), Decimal(0))
+    return (er.fee_pool_total, er.fee_tr_in_total, er.fee_tr_out_total)
+
+
+def summarize_hybrid(hyb: HybridFlowResult) -> Dict[str, Decimal]:
+    """Summarise a hybrid (multi-path) execution for apples-to-apples comparison.
+
+    Returns a dict with unified keys used across outputs.
+    Keys: mode, total_out, total_in, avg_price, alpha_obs, fee_pool_total, fee_tr_in_total, fee_tr_out_total.
+    """
+    return {
+        "mode": "HYBRID",  # type: ignore[dict-item]
+        "total_out": hyb.total_out,
+        "total_in": hyb.total_in,
+        "avg_price": hyb.price_avg,
+        "alpha_obs": hyb.alpha_obs,
+        "fee_pool_total": hyb.fee_pool_total,
+        "fee_tr_in_total": hyb.fee_tr_in_total,
+        "fee_tr_out_total": hyb.fee_tr_out_total,
+        "slippage_price_avg": Decimal(0),  # HybridFlowResult does not carry report; 0 placeholder
+    }
+
+
+def summarize_alpha_scan(res: AlphaScanResult) -> Dict[str, Decimal]:
+    """Summarise alpha-scan at the optimal point α*.
+
+    Uses the point with `alpha == alpha_star` if present; otherwise recomputes the argmin
+    under the same criterion used in `analyze_alpha_scan`.
+    Returns unified keys: mode='ALPHA*', alpha_star, total_out, total_in, avg_price,
+    and the AMM-leg fee totals at α*.
+    """
+    # Prefer exact match on alpha_star
+    pt = next((p for p in res.points if p.alpha == res.alpha_star), None)
+    if pt is None:
+        # Fallback: recompute best using the same criterion
+        feasible_pts = [p for p in res.points if p.feasible]
+        if feasible_pts:
+            pt = min(feasible_pts, key=lambda p: p.avg_price if p.out_total > 0 else Decimal("Inf"))
+        else:
+            pt = min(res.points, key=lambda p: p.avg_price if p.out_total > 0 else Decimal("Inf"))
+    fp, fi, fo = _fee_totals_from_report(pt.res_amm)
+    slip = pt.res_amm.report.slippage_price_avg if pt.res_amm.report is not None else Decimal(0)
+    return {
+        "mode": "ALPHA*",  # type: ignore[dict-item]
+        "alpha_star": res.alpha_star,
+        "total_out": pt.out_total,
+        "total_in": pt.in_total,
+        "avg_price": pt.avg_price,
+        "fee_pool_total": fp,
+        "fee_tr_in_total": fi,
+        "fee_tr_out_total": fo,
+        "slippage_price_avg": slip,
+    }
+
+
+def summarize_crossover(res: CrossoverResult) -> Dict[str, Decimal]:
+    """Summarise q* crossover result.
+
+    Chooses the sample nearest to q* when available; otherwise uses `best_abs`.
+    Returns unified keys: mode='Q*', q_star (or best_abs.q), price_at_q_star (or best_abs diff avg),
+    plus AMM-leg fee totals from the chosen sample.
+    """
+    if res.q_star is not None:
+        # pick the sample closest to q_star among feasible ones; fallback to any
+        feasible = [s for s in res.samples if s.feasible_amm and s.feasible_clob]
+        cand = min(feasible or res.samples, key=lambda s: abs(s.q - res.q_star))
+        q_val = res.q_star
+        price = res.price_at_q_star if res.price_at_q_star is not None else (cand.price_amm + cand.price_clob) / 2
+    else:
+        cand = res.best_abs
+        q_val = cand.q
+        price = (cand.price_amm + cand.price_clob) / 2
+    fp, fi, fo = _fee_totals_from_report(cand.res_amm)
+    slip = cand.res_amm.report.slippage_price_avg if cand.res_amm.report is not None else Decimal(0)
+    return {
+        "mode": "Q*",  # type: ignore[dict-item]
+        "q_star": q_val,
+        "price_at_q_star": price,
+        "fee_pool_total": fp,
+        "fee_tr_in_total": fi,
+        "fee_tr_out_total": fo,
+        "slippage_price_avg": slip,
+    }

@@ -7,6 +7,20 @@ from typing import Iterable, List, Optional, Tuple, Callable
 from .amm_context import AMMContext
 from .steps import Step
 
+# --- Numerical guards for budget-constrained replay ---
+BUDGET_EPS = Decimal("1e-9")        # absolute tolerance on budget (Decimal)
+MAX_FLOW_ITERS = 128                 # hard cap on reverse→forward replay rounds
+
+def _budget_eps(budget0: Optional[Decimal]) -> Decimal:
+    """Compute a tolerant epsilon based on initial budget magnitude.
+
+    We allow a tiny overshoot due to rounding/bucketing: eps = max(abs_epsilon, rel*|budget0|).
+    """
+    if budget0 is None:
+        return BUDGET_EPS
+    rel = (budget0.copy_abs() * BUDGET_EPS)
+    return rel if rel > BUDGET_EPS else BUDGET_EPS
+
 
 @dataclass
 class PaymentSandbox:
@@ -53,11 +67,15 @@ def flow(payment_sandbox: PaymentSandbox,
     remaining_out = out_req
     remaining_in = send_max
 
+    budget0 = send_max  # remember initial budget to derive a stable epsilon
+    eps = _budget_eps(budget0)
+    iters = 0
+
     actual_in = Decimal(0)
     actual_out = Decimal(0)
 
     # Sort by quality bound (desc) each iteration
-    while remaining_out > 0 and (remaining_in is None or remaining_in > 0):
+    while remaining_out > 0 and (remaining_in is None or remaining_in > -eps):
         active: List[Tuple[Decimal, List[Step]]] = []
         for strand in strands:
             try:
@@ -98,7 +116,7 @@ def flow(payment_sandbox: PaymentSandbox,
         # - If budget-limited (remaining_in < required_in), start at the first step (0) using the budget as cap.
         # - Else if a particular step was limiting in reverse, start from that step.
         # - Else start from 0.
-        budget_limited = (remaining_in is not None and remaining_in < required_in)
+        budget_limited = (remaining_in is not None and (remaining_in + eps) < required_in)
         if budget_limited:
             start_idx = 0
             in_cap0 = remaining_in  # budget is the cap
@@ -134,8 +152,14 @@ def flow(payment_sandbox: PaymentSandbox,
         remaining_out = out_req - actual_out
         if remaining_in is not None:
             remaining_in -= in_spent_add
+        if remaining_in is not None and remaining_in < 0 and (-remaining_in) <= eps:
+            remaining_in = Decimal(0)
 
         # Apply staged AMM/CLOB updates for this iteration
         payment_sandbox.apply(apply_sink)
+
+        iters += 1
+        if iters >= MAX_FLOW_ITERS:
+            break
 
     return actual_in, actual_out
