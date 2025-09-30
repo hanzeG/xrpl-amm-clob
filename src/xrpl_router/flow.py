@@ -8,8 +8,11 @@ from .amm_context import AMMContext
 from .steps import Step
 
 # --- Numerical guards for budget-constrained replay ---
+from decimal import Decimal
 BUDGET_EPS = Decimal("1e-9")        # absolute tolerance on budget (Decimal)
-MAX_FLOW_ITERS = 128                 # hard cap on reverse→forward replay rounds
+MAX_FLOW_ITERS = 128                # hard cap on reverse→forward replay rounds
+# Local step-level epsilon (kept at 0 to preserve behaviour)
+STEP_EPS = Decimal("0")
 
 def _budget_eps(budget0: Optional[Decimal]) -> Decimal:
     """Compute a tolerant epsilon based on initial budget magnitude.
@@ -64,6 +67,9 @@ def flow(payment_sandbox: PaymentSandbox,
       * Reverse pass then forward replay (using adapter that collapses book exec).
       * Apply staged writebacks each iteration.
     """
+    # Materialise strands to allow repeatable iteration across rounds
+    strands = list(strands)
+
     remaining_out = out_req
     remaining_in = send_max
 
@@ -100,7 +106,7 @@ def flow(payment_sandbox: PaymentSandbox,
             idx_forward = n_steps - 1 - rev_pos
             _in, _out = step.rev(sb, need)
             rev_records.append((idx_forward, step, need, _out))
-            if _out <= 0:
+            if _out <= STEP_EPS:
                 need = Decimal(0)
                 limiting_idx = idx_forward
                 break
@@ -131,11 +137,11 @@ def flow(payment_sandbox: PaymentSandbox,
         for i in range(start_idx, len(best)):
             step_i = best[i]
             cap = in_cap0 if i == start_idx else out_propagate
-            if cap is None or cap <= 0:
+            if cap is None or cap <= STEP_EPS:
                 ok = False
                 break
             _in2, _out2 = step_i.fwd(sb, cap)
-            if _in2 <= 0 or _out2 <= 0:
+            if _in2 <= STEP_EPS or _out2 <= STEP_EPS:
                 ok = False
                 break
             # Only the first executed step consumes *user* IN; subsequent steps transform amounts internally
@@ -156,6 +162,7 @@ def flow(payment_sandbox: PaymentSandbox,
             remaining_in = Decimal(0)
 
         # Apply staged AMM/CLOB updates for this iteration
+        # Writebacks are applied after each successful iteration, not during reverse/forward passes
         payment_sandbox.apply(apply_sink)
 
         iters += 1

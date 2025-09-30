@@ -85,6 +85,7 @@ class AMM:
             dx_after_tf = dx_g - fee_tr_in
             fee_pool = dx_after_tf * (self.fee if self.fee > 0 else Decimal(0))
             # keep on IN grid (no extra quantisation to avoid bias in preview)
+        # Note: do not re-quantise to avoid bias in preview; use user grids once.
         if dy_n > 0 and self.tr_out > 0:
             one_minus_tr_out = (Decimal(1) - self.tr_out)
             if one_minus_tr_out > 0:
@@ -133,6 +134,8 @@ class AMM:
         else:
             dy_gross = dy_net
         if dy_gross >= self.y:
+            # For stateful callers, we keep an explicit exception on gross-out drain.
+            # Pure preview paths elsewhere return 0 on infeasible; do not change semantics here.
             raise ValueError("requested OUT >= pool reserve (gross)")
         # Effective input needed at curve level
         dx_eff = (dy_gross * self.x) / (self.y - dy_gross)
@@ -454,6 +457,7 @@ class AMM:
         else:
             # already quantized up above; keep as-is.
             pass
+        # Guard against draining the Y reserve on gross-out after applying transfer fees.
         if dy_from_pool >= self.y:
             raise ValueError("apply_fill would drain Y reserve (gross)")
         # Update reserves

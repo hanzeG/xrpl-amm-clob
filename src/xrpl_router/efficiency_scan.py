@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Iterable, List, Optional, Callable, Sequence, Tuple, Dict
 
 
-from .core import Segment, RouteResult, ExecutionReport, ROUTING_CFG
+from .core import Segment, RouteResult, ExecutionReport, ROUTING_CFG, PRICE_EPS
 from .exec_modes import run_trade_mode, ExecutionMode
 # Hybrid flow/step imports
 from .amm_context import AMMContext
@@ -114,7 +114,7 @@ def _with_fee_totals(rr: RouteResult,
 
 def _zero_route_result() -> RouteResult:
     er = ExecutionReport(
-        iterations=0,
+        iterations=[],
         total_out=Decimal(0),
         total_in=Decimal(0),
         avg_price=Decimal(0),
@@ -130,7 +130,7 @@ def _zero_route_result() -> RouteResult:
         filled_out=Decimal(0),
         spent_in=Decimal(0),
         avg_quality=Decimal(0),
-        usage=[],
+        usage={},
         trace=[],
         report=er,
     )
@@ -180,7 +180,7 @@ def _eval_cost_pair(
         deliver_min=deliver_min,
         amm_anchor=amm_anchor,
         amm_curve=amm_curve,
-        amm_context=amm_context,
+        amm_context=None,
     )
     price_clob = (res_clob.spent_in / res_clob.filled_out) if res_clob.filled_out > 0 else Decimal(0)
     feas_clob = (q == 0) or (res_clob.filled_out >= q)
@@ -388,7 +388,7 @@ def find_crossover_q(
     for i in range(1, len(feasible)):
         s0, s1 = feasible[i-1], feasible[i]
         f0, f1 = fval(s0), fval(s1)
-        if (f0 == 0) or (f1 == 0) or (f0 < 0 and f1 > 0) or (f0 > 0 and f1 < 0):
+        if (abs(f0) <= PRICE_EPS) or (abs(f1) <= PRICE_EPS) or (f0 < 0 and f1 > 0) or (f0 > 0 and f1 < 0):
             bracket = (s0.q, s1.q)
             break
 
@@ -417,7 +417,7 @@ def find_crossover_q(
             f_lo = fval(s_lo)
             f_mid = fval(s_mid)
             # Update bracket
-            if (f_lo == 0) or (f_mid == 0) or (f_lo < 0 and f_mid > 0) or (f_lo > 0 and f_mid < 0):
+            if (abs(f_lo) <= PRICE_EPS) or (abs(f_mid) <= PRICE_EPS) or (f_lo < 0 and f_mid > 0) or (f_lo > 0 and f_mid < 0):
                 hi = mid
                 s_hi = s_mid
             else:
@@ -489,8 +489,8 @@ def _wrap_apply_sink_with_fee_meter(amm: AMM | None,
     def wrapped(dx: Decimal, dy: Decimal) -> None:
         if amm is not None:
             # Pass non-negative magnitudes to the AMM fee preview to avoid sign/rounding artefacts
-            dx_abs = dx.copy_abs() if hasattr(dx, 'copy_abs') else (dx if dx >= 0 else -dx)
-            dy_abs = dy.copy_abs() if hasattr(dy, 'copy_abs') else (dy if dy >= 0 else -dy)
+            dx_abs = dx.copy_abs()
+            dy_abs = dy.copy_abs()
             fp, fi, fo = amm.preview_fees_for_fill(dx_abs, dy_abs)
             fee_meter['fee_pool'] = fee_meter.get('fee_pool', Decimal(0)) + fp
             fee_meter['fee_tr_in'] = fee_meter.get('fee_tr_in', Decimal(0)) + fi

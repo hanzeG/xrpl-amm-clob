@@ -58,6 +58,13 @@ class AMMContext:
         """Return the number of iterations in which AMM liquidity was consumed."""
         return self._amm_used_iters
 
+    def reset_iters(self) -> None:
+        """Reset the AMM-used iterations counter to zero.
+
+        Safe to call between trades or before running a new routing session.
+        """
+        self._amm_used_iters = 0
+
     def max_iters_reached(self) -> bool:
         """
         Return True if the maximum number of AMM-consuming iterations was reached.
@@ -92,5 +99,16 @@ class AMMContext:
         nxt = self._fib_prev + self._fib_curr
         self._fib_prev = self._fib_curr
         self._fib_curr = nxt
+
+    def reset_all(self) -> None:
+        """Reset iteration counter and Fibonacci cap state.
+
+        Intended for test setup or to start a fresh trade session without
+        carrying over state.
+        """
+        self._amm_used_iters = 0
+        self._fib_prev = Decimal(0)
+        self._fib_curr = Decimal(0)
+        self._fib_inited = False
 
 __all__ = ["AMMContext"]

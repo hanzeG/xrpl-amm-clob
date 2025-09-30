@@ -86,6 +86,10 @@ IOU_QUANTUM: Decimal = Decimal("1e-15")     # IOU amounts
 QUALITY_QUANTUM: Decimal = Decimal("1e-15") # quality grid
 DEFAULT_QUANTUM: Decimal = IOU_QUANTUM
 
+# Epsilon constants (kept at 0 to preserve existing comparisons; may be raised by callers)
+INST_EPS: Decimal = Decimal("0")     # Instantaneous guards / step filters
+PRICE_EPS: Decimal = Decimal("0")    # Price equality / root-finding tolerances
+
 # -------------------------------
 # Helpers (decimal rounding, quantization, and quality bucketing)
 # -------------------------------
@@ -146,6 +150,83 @@ def calc_quality(out_amt: Decimal, in_amt: Decimal) -> Decimal:
 def quality_bucket(q: Decimal) -> Decimal:
     """Alias: bucket quality by quantising down to QUALITY_QUANTUM."""
     return quantize_quality(q)
+
+# -------------------------------
+# Internal helpers shared by router (no behaviour change; extracted to deduplicate)
+# -------------------------------
+
+def _guard_inst_quality(
+    out_take: Decimal,
+    in_ceiled: Decimal,
+    slice_quality: Decimal,
+    *,
+    in_is_xrp: bool,
+) -> Decimal:
+    """Instantaneous quality guard used when taking a slice.
+
+    Ensures that after rounding the IN amount up to ledger grid, the effective
+    quality (out_take / in_ceiled) does not exceed the advertised slice quality.
+
+    Behaviour is intentionally identical to the repeated inline patterns in the
+    router: if the rounded IN would cause an *improved* quality, we bump IN by
+    one quantum and round again. No epsilon is applied (INST_EPS=0) to preserve
+    current semantics.
+    """
+    if in_ceiled <= 0:
+        return Decimal(0)
+    eff_q = out_take / in_ceiled
+    if eff_q <= slice_quality:
+        return in_ceiled
+    bump = XRP_QUANTUM if in_is_xrp else IOU_QUANTUM
+    return round_in_min(in_ceiled + bump, is_xrp=in_is_xrp)
+
+
+def _ensure_stable_order_ids(
+    segs: List[Segment], order_map_id: Dict[int, int]
+) -> None:
+    """Ensure each Segment object has a stable insertion index keyed by its id().
+
+    This avoids collisions when two distinct Segment instances have identical
+    field values (dataclass equality), which can otherwise merge entries when
+    using the Segment itself as a dict key.
+    """
+    for s in segs:
+        sid = id(s)
+        if sid not in order_map_id:
+            order_map_id[sid] = len(order_map_id)
+
+
+def _sort_by_bucket_stable(
+    segs: List[Segment], order_map_id: Dict[int, int]
+) -> None:
+    """Sort segments by (quality bucket, stable insertion order), best first.
+
+    Quality bucket uses quantised-down QUALITY_QUANTUM. Stable order is the
+    negative of insertion index so earlier entries win ties when reverse=True.
+    """
+    # Make sure all present segments have an order id
+    _ensure_stable_order_ids(segs, order_map_id)
+    segs.sort(
+        key=lambda s: (
+            quality_bucket(s.quality),
+            -order_map_id.get(id(s), 0),
+        ),
+        reverse=True,
+    )
+
+
+def _apply_quality_floor(
+    segs: List[Segment], qmin_bucket: Optional[Decimal]
+) -> List[Segment]:
+    """Filter segments by a quantised quality floor.
+
+    The floor is specified in bucket space (already quantised). If None, the
+    list is returned unchanged. The returned list is a new list; the input list
+    is not modified.
+    """
+    if qmin_bucket is None:
+        return segs
+    return [s for s in segs if quality_bucket(s.quality) >= qmin_bucket]
 
 # -------------------------------
 # Centralised routing/analysis configuration (for reproducibility)

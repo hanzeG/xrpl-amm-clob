@@ -16,7 +16,6 @@ class ExecutionMode(Enum):
     HYBRID = "hybrid"
 
 
-from typing import Optional, Callable
 def run_trade_mode(
     mode: ExecutionMode,
     *,

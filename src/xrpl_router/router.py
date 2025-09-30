@@ -12,12 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable, List, Dict, Callable, Optional
+from typing import Iterable, List, Dict, Callable, Optional, Any
 
 from .core import (
     Segment,
     RouteResult,
-    quantize_down,
     round_in_min,
     round_out_max,
     quality_bucket,
@@ -26,6 +25,9 @@ from .core import (
     ExecutionReport,
     IterationMetrics,
     ROUTING_CFG,
+    _guard_inst_quality,
+    _sort_by_bucket_stable,
+    _apply_quality_floor,
 )
 
 from .amm_context import AMMContext
@@ -72,12 +74,13 @@ def route(
         if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)
     ]
 
-    # Deterministic tie-breaker: remember insertion order for stable secondary sort
-    order_map: Dict[Segment, int] = {}
+    # Deterministic tie-breaker: remember insertion order for stable secondary sort (by id)
+    order_map_id: Dict[int, int] = {}
     def _ensure_order_for_list(lst: List[Segment]) -> None:
         for s in lst:
-            if s not in order_map:
-                order_map[s] = len(order_map)
+            sid = id(s)
+            if sid not in order_map_id:
+                order_map_id[sid] = len(order_map_id)
     _ensure_order_for_list(segs)
 
     # AMM-only bootstrap: if no CLOB segments were provided, try curve once
@@ -94,12 +97,12 @@ def route(
     if not segs:
         raise RouteError("no usable segments")
 
-    segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
+    _sort_by_bucket_stable(segs, order_map_id)
 
     filled_out: Decimal = Decimal(0)
     spent_in: Decimal = Decimal(0)
     usage: Dict[str, Decimal] = {}
-    trace: List[Dict[str, Decimal]] = []
+    trace: List[Dict[str, Any]] = []
 
     preserve = True if config is None else config.preserve_quality_on_limit
     need = target_out
@@ -167,9 +170,7 @@ def route(
                         new_out = cap_out
                         new_in = round_in_min(new_out * ratio, is_xrp=synth.in_is_xrp)
                         # Guard instantaneous quality not to exceed slice quality (quantised bump if needed)
-                        if new_in > 0 and (new_out / new_in) > synth.quality:
-                            q_in_quant = XRP_QUANTUM if synth.in_is_xrp else IOU_QUANTUM
-                            new_in = round_in_min(new_in + q_in_quant, is_xrp=synth.in_is_xrp)
+                        new_in = _guard_inst_quality(new_out, new_in, synth.quality, in_is_xrp=synth.in_is_xrp)
                         synth = Segment(
                             src=synth.src,
                             quality=synth.quality,
@@ -205,9 +206,7 @@ def route(
                             ratio = (cs.in_at_out_max / cs.out_max) if cs.out_max > 0 else Decimal(0)
                             new_in = round_in_min(take_out * ratio, is_xrp=cs.in_is_xrp)
                             # Quality guard as above
-                            if new_in > 0 and (take_out / new_in) > cs.quality:
-                                q_in_quant = XRP_QUANTUM if cs.in_is_xrp else IOU_QUANTUM
-                                new_in = round_in_min(new_in + q_in_quant, is_xrp=cs.in_is_xrp)
+                            new_in = _guard_inst_quality(take_out, new_in, cs.quality, in_is_xrp=cs.in_is_xrp)
                             taken.append(Segment(
                                 src=cs.src,
                                 quality=cs.quality,
@@ -227,7 +226,7 @@ def route(
 
         # Apply per-iteration quality floor if requested
         if qmin_bucket is not None:
-            iter_segs = [s for s in iter_segs if quality_bucket(s.quality) >= qmin_bucket]
+            iter_segs = _apply_quality_floor(iter_segs, qmin_bucket)
 
         if not iter_segs:
             # Drop any AMM segments (none should remain), and if amm_curve is available and segs is empty, try refill once
@@ -241,7 +240,7 @@ def route(
                 _ensure_order_for_list(segs)
                 # Apply the same filter to the refilled segments
                 if qmin_bucket is not None:
-                    segs = [s for s in segs if quality_bucket(s.quality) >= qmin_bucket]
+                    segs = _apply_quality_floor(segs, qmin_bucket)
                 iter_segs = list(segs)
                 if not iter_segs:
                     break
@@ -249,7 +248,7 @@ def route(
                 break
 
         # Sort candidates after injecting synth/curve segments to ensure proper tiering
-        iter_segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
+        _sort_by_bucket_stable(iter_segs, order_map_id)
 
         iter_amm_in: Decimal = Decimal(0)
         iter_amm_out: Decimal = Decimal(0)
@@ -331,10 +330,7 @@ def route(
                     ratio = s.in_at_out_max / s.out_max
                     in_ceil = round_in_min(out_floor * ratio, is_xrp=s.in_is_xrp)
                     # Enforce instantaneous quality not to exceed the slice quality
-                    inst_q_chk = (out_floor / in_ceil) if in_ceil > 0 else Decimal(0)
-                    if inst_q_chk > s.quality:
-                        q_in_quant = XRP_QUANTUM if s.in_is_xrp else IOU_QUANTUM
-                        in_ceil = round_in_min(in_ceil + q_in_quant, is_xrp=s.in_is_xrp)
+                    in_ceil = _guard_inst_quality(out_floor, in_ceil, s.quality, in_is_xrp=s.in_is_xrp)
                 else:
                     in_ceil = Decimal(0)
                 flo_out.append(out_floor)
@@ -367,14 +363,10 @@ def route(
                     add_in = cand_in - flo_in[k]
                     if eff_send_max is not None and (spent_in + sum_in + add_in) > eff_send_max:
                         continue
+                    cand_in = _guard_inst_quality(cand_out, cand_in, s.quality, in_is_xrp=s.in_is_xrp)
                     inst_q = cand_out / cand_in if cand_in > 0 else Decimal(0)
                     if inst_q > s.quality:
-                        # Bump IN by one quantum to enforce anchored quality
-                        q_in_quant = XRP_QUANTUM if s.in_is_xrp else IOU_QUANTUM
-                        cand_in = round_in_min(cand_in + q_in_quant, is_xrp=s.in_is_xrp)
-                        inst_q = cand_out / cand_in if cand_in > 0 else Decimal(0)
-                        if inst_q > s.quality:
-                            continue
+                        continue
                     # Accept top-up
                     remaining_out_gap -= q_out
                     sum_out += q_out
@@ -446,12 +438,24 @@ def route(
                         in_is_xrp=s.in_is_xrp,
                         out_is_xrp=s.out_is_xrp,
                     )
-                    if new_seg not in order_map:
-                        order_map[new_seg] = len(order_map)
+                    _ensure_order_for_list([new_seg])
                     new_tier.append(new_seg)
 
             need = target_out - filled_out
             if need <= 0:
+                # Write back new segments before recording metrics (unify order)
+                segs = [
+                    s for s in (new_tier + rest)
+                    if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")
+                ]
+                _ensure_order_for_list(segs)
+                _sort_by_bucket_stable(segs, order_map_id)
+                if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
+                    if iter_amm_in > 0 or iter_amm_out > 0:
+                        ctx.mark_amm_used_this_iter()
+                        if ctx.multi_path:
+                            ctx.advance_fib()
+                    after_iteration(iter_amm_in, iter_amm_out)
                 # Append per-iteration metrics (complete fill)
                 iter_records.append(IterationMetrics(
                     iter_index=iter_idx,
@@ -468,18 +472,6 @@ def route(
                     slippage_price=slippage_price,
                 ))
                 iter_idx += 1
-                segs = [
-                    s for s in (new_tier + rest)
-                    if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")
-                ]
-                _ensure_order_for_list(segs)
-                segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
-                if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
-                    if iter_amm_in > 0 or iter_amm_out > 0:
-                        ctx.mark_amm_used_this_iter()
-                        if ctx.multi_path:
-                            ctx.advance_fib()
-                    after_iteration(iter_amm_in, iter_amm_out)
                 break
         else:
             # Nothing to do in this tier
@@ -490,7 +482,7 @@ def route(
             if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")
         ]
         _ensure_order_for_list(segs)
-        segs.sort(key=lambda s: (quality_bucket(s.quality), -order_map.get(s, 0)), reverse=True)
+        _sort_by_bucket_stable(segs, order_map_id)
         if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
             if iter_amm_in > 0 or iter_amm_out > 0:
                 ctx.mark_amm_used_this_iter()

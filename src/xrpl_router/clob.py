@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Tuple
 
 from .core import (
     Segment,
@@ -94,7 +94,7 @@ class Clob:
                 out_is_xrp=self.out_is_xrp,
             ))
 
-        # Highest quality first.
+        # Sort by bucketed quality (highest first). Router expects tiers by quality buckets.
         segs.sort(key=lambda s: s.quality, reverse=True)
         return segs
 

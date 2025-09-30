@@ -5,20 +5,16 @@ This module re-exports commonly used types and helpers so other files/tests in t
 repository can import from `xrpl_router` directly instead of deep module paths.
 """
 
-# Core data & config
+# Stable API (intra-repo convenience)
 from .core import Segment, RouteResult, ExecutionReport, ROUTING_CFG
-
-# Routing (single-venue)
 from .router import route
-# Transitional convenience API (kept for compatibility within this repo)
 from .exec_modes import ExecutionMode, run_trade_mode
-
-# AMM multi-path context/state
 from .amm_context import AMMContext
-# AMM interface type (preview_fees_for_fill)
 from .amm import AMM
 
-# Efficiency / analysis layer
+# Analysis / research layer (heavyweight helpers). These are convenient for notebooks
+# and internal studies but are not a stable ABI. Keep imports at the end to reduce
+# risk of circular import during module initialisation.
 from .efficiency_scan import (
     hybrid_flow,
     analyze_alpha_scan,
