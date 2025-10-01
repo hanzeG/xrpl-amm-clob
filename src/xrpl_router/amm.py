@@ -1,13 +1,21 @@
-"""AMM base swaps (constant product, fee on input).
+"""
+AMM base swaps (constant product, fee on input) — **pool math only**.
 
-Rules adopted (impact routing results):
-- Fee is a pool parameter (≤1%) and is deducted on the input side.
-- Given dx→dy: dx_eff = dx*(1-fee); dy = y*dx_eff/(x+dx_eff); dy is floored to amount grid.
-- Given dy→dx: dx_eff = dy*x/(y-dy); dx = dx_eff/(1-fee); dx is ceiled to amount grid.
-- OUT/IN quality is computed conservatively (quantised down) elsewhere when needed.
-- Reject dy ≥ y (cannot drain the pool side).
-- Optional issuer transfer fees (IOU-only): tr_in on X (payer side), tr_out on Y (receiver side).
-  User quality is defined as OUT_net / IN_gross.
+This module contains stateful AMM maths used by the execution engine:
+- Pool fee (≤1%) is deducted on the *input* side.
+- swap_out_given_in / swap_in_given_out implement constant‑product with issuer transfer fees.
+- apply_fill updates reserves using non‑undercredit/undebit quantisation.
+- Small‑trade spot price quality (SPQ) ≈ (y/x)*(1‑fee), quantised down.
+
+Whitepaper alignment:
+- OUT‑side issuer fee is **not** deducted from taker OUT at *segment construction*; it is
+  accounted as ownerGives during execution (§1.3.2.4). This module’s swap methods already
+  preview/handle issuer fees consistently.
+- Strategy for AMM vs CLOB coexistence (anchoring) and multi‑path Fibonacci slicing is handled
+  in `ammliquidity.py` per §1.2.7.1–1.2.7.3. Helpers left here are for research only.
+
+Optional issuer transfer fees (IOU‑only): tr_in on X (payer side), tr_out on Y (receiver side).
+User quality is defined as OUT_net / IN_gross.
 """
 from __future__ import annotations
 
@@ -174,12 +182,18 @@ class AMM:
         anchored slice would push SPQ below the threshold, it shrinks the OUT size by
         bisection until the post-trade SPQ >= threshold (or returns None if no
         feasible positive slice exists).
+
+        Note: Callers should ensure SPQ > threshold (平价及以下不返回); this function now enforces it too.
         """
         # Basic guards
         if self.x <= 0 or self.y <= 0:
             return None
         q = clamp_nonneg(to_decimal(q_threshold))
         if q <= 0:
+            return None
+
+        # Enforce: only anchor when AMM SPQ is strictly better than the threshold (CLOB top)
+        if self.spq() <= q:
             return None
 
         # Local helpers mirroring `apply_fill` without mutating state
@@ -289,6 +303,7 @@ class AMM:
         )
 
     # --- Segmentation (standalone; not used by anchored routing) ---
+    # NOTE: Research utility (non‑whitepaper). Not used by anchored routing; kept for experiments.
     def segments_for_out(self,
                         target_out: Decimal | str | float,
                         *,
@@ -505,6 +520,7 @@ class AMM:
 # Public helpers: unified AMM factories for experiments/tests
 # -----------------------------
 
+# --- Research helpers (non‑whitepaper) ---
 def amm_curve_from_linear(
     base_quality: Decimal,
     slope: Decimal,
@@ -513,7 +529,7 @@ def amm_curve_from_linear(
     in_is_xrp: bool = False,
     out_is_xrp: bool = False,
 ) -> Callable[[Decimal], Iterable[Segment]]:
-    """Return an `amm_curve(target_out)` producing AMM segments with mildly degrading quality.
+    """Research helper (non‑whitepaper). Return an `amm_curve(target_out)` producing AMM segments with mildly degrading quality.
 
     The instantaneous quality is `q_inst = base_quality - slope * max(target_out, 0)`
     (clamped to >0). The curve emits fixed-size OUT slices of `seg_out` until it reaches
@@ -569,6 +585,7 @@ def amm_curve_from_linear(
     return amm_curve
 
 
+# --- Research helpers (non‑whitepaper) ---
 def amm_anchor_from_discount(
     discount: Decimal,
     *,
@@ -576,7 +593,7 @@ def amm_anchor_from_discount(
     in_is_xrp: bool = False,
     out_is_xrp: bool = False,
 ) -> Callable[[Decimal, Decimal], Optional[Segment]]:
-    """Return an `amm_anchor(q_lob_top, need)` that proposes a single anchored AMM slice.
+    """Research helper (non‑whitepaper). Return an `amm_anchor(q_lob_top, need)` that proposes a single anchored AMM slice.
 
     Given the current CLOB top quality `q_lob_top`, the anchored slice uses
     `q = q_lob_top * discount` (i.e., slightly worse than the book top) and

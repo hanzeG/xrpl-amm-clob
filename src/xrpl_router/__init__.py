@@ -1,20 +1,43 @@
 from __future__ import annotations
 """Central API surface for repository-internal imports.
 
-This module re-exports commonly used types and helpers so other files/tests in this
-repository can import from `xrpl_router` directly instead of deep module paths.
+Production vs research layering
+-------------------------------
+- **Production (whitepaper-aligned)**: use `BookStep` for execution (per-iteration
+  Phase A/B inside the step), `AMM` for pool maths, and `AMMContext` for AMM usage
+  bookkeeping. These symbols are exported at module top-level.
+- **Research / legacy**: the old router (`route`) and execution-mode helpers live
+  under the research section below and are not part of the stable production API.
+
+This separation keeps production code aligned with the whitepaper while still
+making it convenient to run experiments and scans from the same package.
 """
 
-# Stable API (intra-repo convenience)
-from .core import Segment, RouteResult, ExecutionReport, ROUTING_CFG
-from .router import route
-from .exec_modes import ExecutionMode, run_trade_mode
+# -----------------
+# Production (stable intra-repo surface)
+# -----------------
+from .core import Segment, RouteResult, ExecutionReport
+from .book_step import BookStep
 from .amm_context import AMMContext
 from .amm import AMM
 
-# Analysis / research layer (heavyweight helpers). These are convenient for notebooks
-# and internal studies but are not a stable ABI. Keep imports at the end to reduce
-# risk of circular import during module initialisation.
+__all__ = [
+    # core data types
+    "Segment",
+    "RouteResult",
+    "ExecutionReport",
+    # execution building blocks
+    "BookStep",
+    "AMMContext",
+    "AMM",
+]
+
+# -----------------
+# Research / legacy (non-stable)
+# -----------------
+# Heavyweight helpers for notebooks and internal studies; API may change.
+from .path_builder import route  # legacy router (research-only)
+from .exec_modes import ExecutionMode, run_trade_mode
 from .efficiency_scan import (
     hybrid_flow,
     analyze_alpha_scan,

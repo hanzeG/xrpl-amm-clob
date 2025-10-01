@@ -1,6 +1,8 @@
 """CLOB → segments: turn price levels into homogeneous quote slices.
-Includes optional issuer transfer fees (IOU-only): tr_in on IN, tr_out on OUT.
-Quality is user-view: OUT_net / IN_gross.
+Issuer transfer fees (IOU-only) are supported via tr_in (on IN) and tr_out (on OUT),
+but **OUT-side fees are not deducted** at segment construction time (taker-view OUT).
+Quality is taker-view: OUT / IN_gross. OUT-side issuer fee is accounted during
+execution (ownerGives), per whitepaper §1.3.2.4.
 
 Helpers (public):
 - make_ladder(depth, top_quality, qty_per_level, decay, ...): canonical geometric ladder
@@ -11,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Optional
 
 from .core import (
     Segment,
@@ -70,10 +72,7 @@ class Clob:
         for lvl in self.levels:
             # Snap to amount grids and apply transfer fees.
             out_gross = round_out_max(lvl.out_liquidity, is_xrp=self.out_is_xrp)
-            out_net = round_out_max(
-                out_gross * (Decimal(1) - self.tr_out), is_xrp=self.out_is_xrp
-            )
-            if out_net <= 0:
+            if out_gross <= 0:
                 continue
             in_req_at_price = lvl.price_in_per_out * out_gross
             if self.tr_in > 0:
@@ -82,16 +81,19 @@ class Clob:
             if in_gross <= 0:
                 continue
             # Use quality bucket for tier grouping.
-            q = quality_bucket(calc_quality(out_net, in_gross))
+            raw_q = calc_quality(out_gross, in_gross)
+            q = quality_bucket(raw_q)
             if q <= 0:
                 continue
             segs.append(Segment(
                 src="CLOB",
                 quality=q,
-                out_max=out_net,
+                out_max=out_gross,
                 in_at_out_max=in_gross,
                 in_is_xrp=self.in_is_xrp,
                 out_is_xrp=self.out_is_xrp,
+                raw_quality=raw_q,
+                source_id=None,
             ))
 
         # Sort by bucketed quality (highest first). Router expects tiers by quality buckets.
@@ -198,6 +200,7 @@ def normalise_segments(segs: Iterable[Segment]) -> List[Segment]:
         q = quality_bucket(calc_quality(out_max, in_need))
         if q <= 0:
             continue
+        raw_q = calc_quality(out_max, in_need)
         out.append(Segment(
             src="CLOB",
             quality=q,
@@ -205,6 +208,8 @@ def normalise_segments(segs: Iterable[Segment]) -> List[Segment]:
             in_at_out_max=in_need,
             in_is_xrp=s.in_is_xrp,
             out_is_xrp=s.out_is_xrp,
+            raw_quality=raw_q,
+            source_id=getattr(s, "source_id", None),
         ))
     out.sort(key=lambda z: z.quality, reverse=True)
     return out

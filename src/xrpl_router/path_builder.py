@@ -24,7 +24,6 @@ from .core import (
     IOU_QUANTUM,
     ExecutionReport,
     IterationMetrics,
-    ROUTING_CFG,
     _guard_inst_quality,
     _sort_by_bucket_stable,
     _apply_quality_floor,
@@ -47,6 +46,34 @@ class RouteConfig:
     preserve_quality_on_limit: bool = True
 
 
+# Tie-break helper: prefer CLOB over AMM when both present at equal quality (same tier)
+from typing import Iterable, List, Dict
+def _prefer_clob_on_ties(segs: Iterable[Segment]) -> List[Segment]:
+    """When AMM and CLOB are at equal quality (same tier), prefer CLOB.
+    Uses raw_quality if present, else bucketed quality.
+    """
+    segs_list = [s for s in segs if s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0]
+    if not segs_list:
+        return []
+    tiers: Dict[Decimal, List[bool]] = {}
+    for s in segs_list:
+        key = (s.raw_quality or s.quality)
+        flags = tiers.get(key, [False, False])
+        if s.src == "CLOB":
+            flags[0] = True
+        elif s.src == "AMM":
+            flags[1] = True
+        tiers[key] = flags
+    out: List[Segment] = []
+    for s in segs_list:
+        key = (s.raw_quality or s.quality)
+        has_clob, has_amm = tiers.get(key, (False, False))
+        if has_clob and has_amm and s.src == "AMM":
+            continue
+        out.append(s)
+    return out
+
+
 def route(
     target_out: Decimal,
     segments: Iterable[Segment],
@@ -63,16 +90,16 @@ def route(
     """Route a target OUT across segments in descending quality order.
 
     The optional `limit_quality` enforces a per-iteration quality floor (bucketed), consistent with the whitepaper flow(Strands)/offer crossing semantics.
+
+    Additionally:
+    - Tie-break rule (§1.2.7.2): when AMM and CLOB are equal-quality in a tier, CLOB is preferred.
     """
     if target_out is None:
         raise RouteError("target_out is None")
     if target_out <= 0:
         raise RouteError("target_out must be > 0")
 
-    segs: List[Segment] = [
-        s for s in segments
-        if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)
-    ]
+    segs: List[Segment] = _prefer_clob_on_ties(segments)
 
     # Deterministic tie-breaker: remember insertion order for stable secondary sort (by id)
     order_map_id: Dict[int, int] = {}
@@ -89,10 +116,7 @@ def route(
             curve_boot = list(amm_curve(target_out))
         except TypeError:
             curve_boot = []  # backward-compat: older signature
-        segs = [
-            s for s in curve_boot
-            if (s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)
-        ]
+        segs = _prefer_clob_on_ties(curve_boot)
 
     if not segs:
         raise RouteError("no usable segments")
@@ -112,19 +136,6 @@ def route(
 
     ctx = amm_context or AMMContext(False)
 
-    def _amm_out_cap_for_iter(remaining_out: Decimal) -> Decimal:
-        """Return the AMM OUT cap for this iteration under multi-path Fibonacci policy."""
-        if not ctx.multi_path:
-            return remaining_out
-        # Conservative base cap: small fraction of remaining need, at least one IOU quantum
-        base = (remaining_out * ROUTING_CFG.fib_base_factor) if remaining_out > 0 else IOU_QUANTUM
-        if base <= 0:
-            base = IOU_QUANTUM
-        cap = ctx.current_fib_cap(base)
-        if cap <= 0:
-            cap = IOU_QUANTUM
-        return min(cap, remaining_out)
-
     # --- Metrics reporting ---
     iter_records: List[IterationMetrics] = []
     iter_idx: int = 0
@@ -136,13 +147,7 @@ def route(
     else:
         qmin_bucket = None
 
-    # No-improvement ceiling (whitepaper): later iterations cannot exceed the *effective* quality of prior iterations
-    # Keep both raw (unbucketed) and bucketed trackers: use RAW for enforcement to avoid bucket-leak improvements.
-    qmax_ceiling_raw: Optional[Decimal] = None
-    qmax_ceiling_bucket: Optional[Decimal] = None
-
-    # Enforce whitepaper no-improvement at the level of effective marginal price per iteration
-    price_floor_raw: Optional[Decimal] = None  # minimum allowed effective price for subsequent iterations
+    # (No-improvement ceiling/floor tracking removed: whitepaper semantics only)
 
     while need > 0:
         # If no segments are available at the start of an iteration, try sourcing from AMM curve
@@ -151,7 +156,7 @@ def route(
                 refilled = list(amm_curve(need))
             except TypeError:
                 refilled = []
-            segs = [s for s in refilled if (s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)]
+            segs = _prefer_clob_on_ties(refilled)
             _ensure_order_for_list(segs)
             # If still empty after attempting to refill, break (nothing more to route)
             if not segs:
@@ -168,69 +173,27 @@ def route(
         iter_segs = list(segs)
 
         if q_lob_top > 0 and amm_anchor:
-            if not ctx.max_iters_reached():
-                cap_out = _amm_out_cap_for_iter(need)
+            if not ctx.maxItersReached():
                 synth = amm_anchor(q_lob_top, need)
                 if synth is not None:
-                    # Trim synthetic slice to Fibonacci cap if necessary (preserve slice ratio)
-                    if cap_out > 0 and synth.out_max > cap_out:
-                        ratio = (synth.in_at_out_max / synth.out_max) if synth.out_max > 0 else Decimal(0)
-                        new_out = cap_out
-                        new_in = round_in_min(new_out * ratio, is_xrp=synth.in_is_xrp)
-                        # Guard instantaneous quality not to exceed slice quality (quantised bump if needed)
-                        new_in = _guard_inst_quality(new_out, new_in, synth.quality, in_is_xrp=synth.in_is_xrp)
-                        synth = Segment(
-                            src=synth.src,
-                            quality=synth.quality,
-                            out_max=new_out,
-                            in_at_out_max=new_in,
-                            in_is_xrp=synth.in_is_xrp,
-                            out_is_xrp=synth.out_is_xrp,
-                        )
                     iter_segs.append(synth)
         elif q_lob_top == 0 and amm_curve is not None:
             # No CLOB top → AMM self-pricing via curve segments
             curve_mode = True
             curve_segs = []
-            if not ctx.max_iters_reached():
+            if not ctx.maxItersReached():
                 try:
                     curve_segs = list(amm_curve(need))
                 except TypeError:
                     curve_segs = []  # backward-compat signature
                 # Filter invalid segments
                 curve_segs = [cs for cs in curve_segs if cs and cs.out_max > 0 and cs.in_at_out_max > 0 and cs.quality > 0]
-                # Enforce Fibonacci cap across curve segments in this iteration
-                cap_out = _amm_out_cap_for_iter(need)
-                if cap_out > 0:
-                    taken: List[Segment] = []
-                    remaining_cap = cap_out
-                    for cs in curve_segs:
-                        if remaining_cap <= 0:
-                            break
-                        take_out = min(cs.out_max, remaining_cap)
-                        if take_out <= 0:
-                            continue
-                        if take_out < cs.out_max:
-                            ratio = (cs.in_at_out_max / cs.out_max) if cs.out_max > 0 else Decimal(0)
-                            new_in = round_in_min(take_out * ratio, is_xrp=cs.in_is_xrp)
-                            # Quality guard as above
-                            new_in = _guard_inst_quality(take_out, new_in, cs.quality, in_is_xrp=cs.in_is_xrp)
-                            taken.append(Segment(
-                                src=cs.src,
-                                quality=cs.quality,
-                                out_max=take_out,
-                                in_at_out_max=new_in,
-                                in_is_xrp=cs.in_is_xrp,
-                                out_is_xrp=cs.out_is_xrp,
-                            ))
-                            remaining_cap -= take_out
-                        else:
-                            taken.append(cs)
-                            remaining_cap -= cs.out_max
-                    curve_segs = taken
             iter_segs.extend(curve_segs)
 
         _ensure_order_for_list(iter_segs)
+
+        # Enforce "prefer CLOB on ties" before sorting/tiering
+        iter_segs = _prefer_clob_on_ties(iter_segs)
 
         # No pre-filtering by "quality ceiling": we enforce no-improvement via an effective-price floor
         # applied after grid rounding at the iteration level (see below).
@@ -247,7 +210,7 @@ def route(
                     refilled = list(amm_curve(need))
                 except TypeError:
                     refilled = []
-                segs = [s for s in refilled if (s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0)]
+                segs = _prefer_clob_on_ties(refilled)
                 _ensure_order_for_list(segs)
                 # Apply the same filter to the refilled segments
                 if qmin_bucket is not None:
@@ -390,23 +353,6 @@ def route(
             iter_in_sum = sum(flo_in)
             iter_price_eff = (iter_in_sum / iter_out_sum) if iter_out_sum > 0 else Decimal(0)
 
-            # Enforce per-iteration effective-price floor (no-improvement):
-            # If the current effective price is cheaper than the previous iteration, raise IN just enough
-            # (respecting the IN grid) to meet the floor. This preserves proportional OUTs and avoids
-            # bucket-boundary leakage.
-            if price_floor_raw is not None and iter_out_sum > 0 and iter_price_eff < price_floor_raw:
-                in_is_xrp_tier = any(s.in_is_xrp for s in tier)
-                target_in = round_in_min(iter_out_sum * price_floor_raw, is_xrp=in_is_xrp_tier)
-                add_in = target_in - iter_in_sum
-                if add_in > 0:
-                    # Attribute the additional IN to the first filled slice (AMM or CLOB). This increases price
-                    # without changing OUT, and cannot violate instantaneous-quality guards (we're making it worse).
-                    for idx in range(len(flo_in)):
-                        if flo_out[idx] > 0:
-                            flo_in[idx] += add_in
-                            break
-                    iter_in_sum = sum(flo_in)
-                    iter_price_eff = (iter_in_sum / iter_out_sum) if iter_out_sum > 0 else Decimal(0)
 
             # Baseline price for slippage at this tier, aligned to ledger rounding (computed AFTER enforcing floor)
             if current_tier_bucket > 0 and iter_out_sum > 0:
@@ -488,20 +434,8 @@ def route(
                 _sort_by_bucket_stable(segs, order_map_id)
                 if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
                     if iter_amm_in > 0 or iter_amm_out > 0:
-                        ctx.mark_amm_used_this_iter()
-                        if ctx.multi_path:
-                            ctx.advance_fib()
+                        ctx.setAMMUsed()
                     after_iteration(iter_amm_in, iter_amm_out)
-                # Update no-improvement ceiling to this iteration's effective quality
-                if iter_in_sum > 0 and iter_out_sum > 0:
-                    q_eff_raw = (iter_out_sum / iter_in_sum)
-                    q_eff_bucket = quality_bucket(q_eff_raw)
-                    qmax_ceiling_raw = (
-                        q_eff_raw if qmax_ceiling_raw is None else min(qmax_ceiling_raw, q_eff_raw)
-                    )
-                    qmax_ceiling_bucket = (
-                        q_eff_bucket if qmax_ceiling_bucket is None else min(qmax_ceiling_bucket, q_eff_bucket)
-                    )
                 # Append per-iteration metrics (complete fill)
                 iter_records.append(IterationMetrics(
                     iter_index=iter_idx,
@@ -518,9 +452,6 @@ def route(
                     slippage_price=slippage_price,
                 ))
                 iter_idx += 1
-                # Set/update floor for subsequent iterations
-                if iter_out_sum > 0:
-                    price_floor_raw = iter_price_eff
                 break
         else:
             # Nothing to do in this tier
@@ -534,22 +465,10 @@ def route(
         _sort_by_bucket_stable(segs, order_map_id)
         if after_iteration is not None and (iter_amm_in > 0 or iter_amm_out > 0):
             if iter_amm_in > 0 or iter_amm_out > 0:
-                ctx.mark_amm_used_this_iter()
-                if ctx.multi_path:
-                    ctx.advance_fib()
+                ctx.setAMMUsed()
             after_iteration(iter_amm_in, iter_amm_out)
         # Append per-iteration metrics (normal continue)
         if need > 0 and tier:
-            # Update no-improvement ceiling to this iteration's effective quality
-            if iter_in_sum > 0 and iter_out_sum > 0:
-                q_eff_raw = (iter_out_sum / iter_in_sum)
-                q_eff_bucket = quality_bucket(q_eff_raw)
-                qmax_ceiling_raw = (
-                    q_eff_raw if qmax_ceiling_raw is None else min(qmax_ceiling_raw, q_eff_raw)
-                )
-                qmax_ceiling_bucket = (
-                    q_eff_bucket if qmax_ceiling_bucket is None else min(qmax_ceiling_bucket, q_eff_bucket)
-                )
             iter_records.append(IterationMetrics(
                 iter_index=iter_idx,
                 tier_quality=current_tier_bucket,
@@ -565,9 +484,6 @@ def route(
                 slippage_price=slippage_price,
             ))
             iter_idx += 1
-            # Set/update floor for subsequent iterations
-            if iter_out_sum > 0:
-                price_floor_raw = iter_price_eff
         need = target_out - filled_out
 
         if eff_send_max is not None and spent_in >= eff_send_max:

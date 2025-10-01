@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Iterable, Optional, Callable, List
 
 from .core import Segment, RouteResult
-from .router import route, RouteConfig
+from .path_builder import route, RouteConfig
 from .amm_context import AMMContext
 
 

@@ -1,3 +1,14 @@
+"""
+Research layer utilities for execution-efficiency analysis.
+
+NOTE:
+- The whitepaper (§1.2–1.3) algorithm always enables both AMM and CLOB with
+  per-iteration, quality-based selection. The helpers here (alpha scan,
+  crossover search, and a hybrid two-leg wrapper) are **research tools** and
+  not part of the core execution engine.
+- AMMContext now only tracks multipath flag and AMM-using iteration count (≤30);
+  Fibonacci slicing is implemented in the AMM liquidity layer.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,7 +23,7 @@ from .amm_context import AMMContext
 from .amm import AMM
 # Hybrid flow/step imports
 from .flow import PaymentSandbox, flow
-from .steps import Step, BookStepAdapter
+from .steps import Step
 
 # Upper bound target used when enforcing an *input* cap in Step.fwd()
 # We request a very large OUT and let send_max cap the actual spend,
@@ -156,6 +167,7 @@ def _eval_cost_pair(
         segments=segments,
         send_max=send_max,
         deliver_min=deliver_min,
+        limit_quality=None,
         amm_anchor=amm_anchor,
         amm_curve=amm_curve,
         amm_context=amm_context,
@@ -178,6 +190,7 @@ def _eval_cost_pair(
         segments=segments,
         send_max=send_max,
         deliver_min=deliver_min,
+        limit_quality=None,
         amm_anchor=amm_anchor,
         amm_curve=amm_curve,
         amm_context=None,
@@ -462,10 +475,6 @@ __all__ = [
 
 # ---------------- Hybrid (multi-path) execution using flow() -----------------
 
-from dataclasses import dataclass
-from decimal import Decimal
-from typing import Iterable, List, Optional, Callable
-
 @dataclass(frozen=True)
 class HybridFlowResult:
     total_in: Decimal
@@ -501,7 +510,10 @@ def _wrap_apply_sink_with_fee_meter(amm: AMM | None,
 
 
 class _ClobStepForHybrid(Step):
-    """Flow step that executes CLOB-only via router; tracks contribution."""
+    """Flow step that executes CLOB-only via router; tracks contribution.
+    
+    Research-layer step (not the whitepaper BookStep).
+    """
     def __init__(self,
                  segments_provider: Callable[[], Iterable[Segment]],
                  *,
@@ -524,7 +536,7 @@ class _ClobStepForHybrid(Step):
         segs = list(self._segments_provider())
         if not segs:
             return Decimal(0)
-        return max(s.quality for s in segs)
+        return max((s.raw_quality or s.quality) for s in segs)
 
     def rev(self, sandbox: PaymentSandbox, out_req: Decimal):
         # Cap reverse request by remaining CLOB capacity observed in this hybrid run
@@ -586,6 +598,8 @@ class _ClobStepForHybrid(Step):
 class _AmmStepForHybrid(Step):
     """Flow step that executes AMM-only via router; tracks contribution.
 
+    Research-layer step (not the whitepaper BookStep).
+
     For quality_upper_bound(), we probe amm_curve with a tiny target to get an
     upper-bound quality snapshot without mutating state.
     """
@@ -610,7 +624,7 @@ class _AmmStepForHybrid(Step):
 
     def quality_upper_bound(self) -> Decimal:
         # If AMM iteration cap is reached, this leg should be unavailable
-        if self._amm_context is not None and self._amm_context.max_iters_reached():
+        if self._amm_context is not None and self._amm_context.maxItersReached():
             return Decimal(0)
         if self._amm_curve is None:
             return Decimal(0)
@@ -621,18 +635,11 @@ class _AmmStepForHybrid(Step):
         segs = [s for s in segs if s and s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0]
         if not segs:
             return Decimal(0)
-        # Lazy-initialise Fibonacci base in AMMContext (whitepaper §1.2.7.3):
-        # calling current_fib_cap(base) will initialise if not yet inited, without advancing.
-        if self._amm_context is not None:
-            try:
-                self._amm_context.current_fib_cap(self._probe)
-            except Exception:
-                pass
-        return max(s.quality for s in segs)
+        return max((s.raw_quality or s.quality) for s in segs)
 
     def rev(self, sandbox: PaymentSandbox, out_req: Decimal):
         # Do not simulate AMM leg if cap reached
-        if self._amm_context is not None and self._amm_context.max_iters_reached():
+        if self._amm_context is not None and self._amm_context.maxItersReached():
             self._cached_in, self._cached_out = Decimal(0), Decimal(0)
             return self._cached_in, self._cached_out
         # Reverse pass: AMM-only, bootstrap via amm_curve inside router; no writebacks
@@ -650,7 +657,7 @@ class _AmmStepForHybrid(Step):
 
     def fwd(self, sandbox: PaymentSandbox, in_cap: Decimal):
         # If cap already reached, AMM must not contribute this iteration
-        if self._amm_context is not None and self._amm_context.max_iters_reached():
+        if self._amm_context is not None and self._amm_context.maxItersReached():
             self._cached_in, self._cached_out = Decimal(0), Decimal(0)
             # Ensure meter records zero contribution
             self._meter.setdefault('amm_out', Decimal(0))
@@ -687,15 +694,9 @@ class _AmmStepForHybrid(Step):
         # Track contribution
         self._meter.setdefault('amm_out', Decimal(0))
         self._meter['amm_out'] += self._cached_out
-        # Advance AMM usage + Fibonacci cap only when AMM actually contributed this iteration
+        # Mark AMM used only when AMM actually contributed this iteration
         if self._amm_context is not None and self._cached_out > 0:
-            # Ensure Fibonacci is initialised (no-op if already inited)
-            try:
-                self._amm_context.current_fib_cap(self._probe)
-            except Exception:
-                pass
-            self._amm_context.mark_amm_used_this_iter()
-            self._amm_context.advance_fib()
+            self._amm_context.setAMMUsed()
         return self._cached_in, self._cached_out
 
 
@@ -723,9 +724,8 @@ def hybrid_flow(
     # Shared sandbox and context
     sb = PaymentSandbox()
     ctx = amm_context or AMMContext(False)
-    ctx.set_multi_path(True)
-    # Snapshot AMM usage iterations to restore if AMM leg remains unused
-    prev_amm_used_iters = ctx.amm_used_iters
+    ctx.setMultiPath(True)
+    prev_amm_used_iters = ctx.ammUsedIters
 
     wrapped_apply = _wrap_apply_sink_with_fee_meter(amm_for_fees, apply_sink, fee_meter)
     # Per-run CLOB capacity (sum of declared out_max); used to prevent reusing the book across iterations

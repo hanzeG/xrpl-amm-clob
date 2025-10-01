@@ -4,7 +4,7 @@ Centralises Decimal policy (precision, quantum, rounding) so AMM, CLOB, and the 
 
 Whitepaper alignment (for cross‑reference):
 - §1.3.2  Reverse→Forward execution and limiting‑step replay — these helpers ensure price/amount rounding is consistent across reverse pass estimates and forward replays.
-- §1.2.7.3 Multi‑path AMM behaviour (Fibonacci slicing & bounded iterations) — configuration keys in `RoutingConfig` are used by higher layers to enforce the AMM OUT caps each iteration.
+- §1.2.7.3 Multi‑path AMM behaviour (Fibonacci slicing & bounded iterations) — enforcement lives in AMMContext/AMMLiquidity; router no longer enforces caps.
 
 Quality is always quantised on QUALITY_QUANTUM (down); IOU/XRP amounts are quantised on their respective grids.
 """
@@ -21,13 +21,23 @@ from typing import Literal, Dict, Any, List, Optional
 
 @dataclass(frozen=True)
 class Segment:
-    """A homogeneous quote slice used by the router."""
+    """A homogeneous quote slice used by the router.
+    
+    Notes:
+    - `quality` is the **bucketed** quality (quantised to QUALITY_QUANTUM) for tiering/sorting.
+    - `raw_quality` preserves the **unbucketed** quality for precise equality/priority checks
+      (e.g., “AMM == CLOB” → prefer CLOB per whitepaper §1.2.7.2).
+    - Fees on the OUT side are *not* deducted here (taker-view OUT).
+      OUT-side issuer fee is accounted during execution (ownerGives) per §1.3.2.4.
+    """
     src: Literal["AMM", "CLOB"]
-    quality: Decimal            # OUT / IN (higher is better)
+    quality: Decimal            # OUT / IN (higher is better) — bucketed
     out_max: Decimal            # Max OUT available on this slice
     in_at_out_max: Decimal      # IN required to consume out_max
     in_is_xrp: bool             # Input asset uses XRP grid (drops)
     out_is_xrp: bool            # Output asset uses XRP grid (drops)
+    raw_quality: Optional[Decimal] = None  # Unbucketed OUT/IN for precise comparisons
+    source_id: Optional[str] = None        # Optional external identifier (e.g., offer id / pool tag)
 
 
 # --- Per-iteration and aggregate execution metrics ---
@@ -148,6 +158,20 @@ def calc_quality(out_amt: Decimal, in_amt: Decimal) -> Decimal:
     return quantize_quality(q)
 
 
+def compose_path_quality(step_qualities: List[Decimal]) -> Decimal:
+    """Compose a path/strand quality as the product of step qualities.
+    
+    Returns 0 if any step quality is non-positive. The result is quantised
+    down to QUALITY_QUANTUM, matching whitepaper §1.3.2 path quality usage.
+    """
+    q = Decimal(1)
+    for s in step_qualities:
+        if s <= 0:
+            return Decimal(0)
+        q *= s
+    return quantize_quality(q)
+
+
 def quality_bucket(q: Decimal) -> Decimal:
     """Alias: bucket quality by quantising down to QUALITY_QUANTUM."""
     return quantize_quality(q)
@@ -243,10 +267,10 @@ class RoutingConfig:
     across modules. Callers can import and override `ROUTING_CFG` at runtime if needed.
 
     Whitepaper cross‑references:
-    - `fib_base_factor` → §1.2.7.3 (Fibonacci slicing in multi‑path AMM). Controls the base OUT cap for the first two AMM slices each time AMM participates; caps then grow fibonaccially per iteration.
+    - `fib_base_factor` → §1.2.7.3 (Fibonacci slicing in multi‑path AMM). Used by AMMLiquidity to size AMM slices when multi‑path is active; AMMContext enforces the ≤30 iteration cap.
     - `alpha_step_default` → α‑scan granularity when searching for the optimal split ratio α* (task spec: Execution Efficiency).
     - `qscan_coarse_steps` / `qscan_refine_iters` → scanning and bisection depth for the crossover size q* between AMM‑only and CLOB‑only costs.
-    - `amm_max_iters` → documented upper bound for AMM participation count (whitepaper: capped iterations); enforcement lives in AMMContext.
+    - `amm_max_iters` → documented upper bound for AMM participation count (whitepaper: capped iterations); enforcement lives in AMMContext/AMMLiquidity.
 
     Recommended ranges (typical studies):
     - `fib_base_factor`: 1e‑5 … 1e‑3  (larger ⇒ fewer but coarser AMM slices per iteration)
@@ -274,6 +298,7 @@ __all__ = [
     "quantize_down",
     "quantize_up",
     "calc_quality",
+    "compose_path_quality",
     "Segment",
     "IterationMetrics",
     "ExecutionReport",

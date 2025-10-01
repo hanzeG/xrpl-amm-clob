@@ -2,12 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Callable, Iterable, Optional, Tuple, List
 
-from .core import Segment, quality_bucket
-from .router import route, RouteConfig
-from .amm_context import AMMContext
-
+from .core import Segment
 
 class Step:
     """Abstract payment step interface (whitepaper §1.3.1).
@@ -36,59 +33,55 @@ class Step:
 
 
 @dataclass
-class BookStepAdapter(Step):
-    """Adapter that treats the existing router as a single Book/Direct step.
+class DirectStepI(Step):
+    """IOU→IOU direct transfer step (whitepaper §1.3.1).
 
-    This bridges the whitepaper flow without changing the current router.
+    NOTE: Skeleton placeholder for Batch 2. The actual fee and issuer‑transfer
+    accounting (ownerGives/stpAmt) will be implemented when BookStep is
+    introduced. Do not instantiate in production yet.
     """
-
-    segments_provider: Callable[[], Iterable[Segment]]
-    amm_anchor: Optional[Callable[[Decimal, Decimal], Optional[Segment]]] = None
-    amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]] = None
-    amm_context: Optional[AMMContext] = None
-    limit_quality: Optional[Decimal] = None
-
-    def _exec(self,
-              sandbox: "PaymentSandbox",
-              after_iteration: Optional[Callable[[Decimal, Decimal], None]],
-              *,
-              target_out: Optional[Decimal] = None,
-              send_max: Optional[Decimal] = None) -> Tuple[Decimal, Decimal]:
-        assert (target_out is None) ^ (send_max is None), "use either target_out or send_max"
-        segs = list(self.segments_provider())
-        if not segs:
-            self._cached_in = Decimal(0)
-            self._cached_out = Decimal(0)
-            return self._cached_in, self._cached_out
-
-        res = route(
-            target_out=target_out if target_out is not None else Decimal("1e40"),
-            segments=segs,
-            config=RouteConfig(preserve_quality_on_limit=True),
-            amm_anchor=self.amm_anchor,
-            amm_curve=self.amm_curve,
-            amm_context=self.amm_context,
-            send_max=send_max,
-            limit_quality=self.limit_quality,
-            after_iteration=after_iteration,
-        )
-        self._cached_in = res.spent_in
-        self._cached_out = res.filled_out
-        return self._cached_in, self._cached_out
+    in_is_xrp: bool = False
+    out_is_xrp: bool = False
 
     def rev(self, sandbox: "PaymentSandbox", out_req: Decimal) -> Tuple[Decimal, Decimal]:
-        # Reverse pass: do not stage writebacks.
-        return self._exec(sandbox, None, target_out=out_req, send_max=None)
+        # Placeholder: identity mapping (no fees). To be replaced.
+        self._cached_in = out_req
+        self._cached_out = out_req
+        return self._cached_in, self._cached_out
 
     def fwd(self, sandbox: "PaymentSandbox", in_cap: Decimal) -> Tuple[Decimal, Decimal]:
-        # Forward pass: stage writebacks using sandbox callback.
-        return self._exec(sandbox, sandbox.stage_after_iteration, target_out=None, send_max=in_cap)
+        # Placeholder: pass‑through, no writebacks here (Direct transfer writebacks
+        # will be staged by sandbox in Batch 2).
+        self._cached_in = in_cap
+        self._cached_out = in_cap
+        return self._cached_in, self._cached_out
 
     def quality_upper_bound(self) -> Decimal:
-        try:
-            segs = list(self.segments_provider())
-        except Exception:
-            return Decimal(0)
-        if not segs:
-            return Decimal(0)
-        return max(quality_bucket(s.quality) for s in segs)
+        # Neutral bound (1.0) as placeholder.
+        return Decimal(1)
+
+
+@dataclass
+class XRPEndpointStep(Step):
+    """XRP endpoint step (source/sink), whitepaper §1.3.1.
+
+    NOTE: Skeleton placeholder for Batch 2. Wallet balance checks and staging
+    to sandbox will be added with proper ledger plumbing.
+    """
+    is_source: bool = True
+
+    def rev(self, sandbox: "PaymentSandbox", out_req: Decimal) -> Tuple[Decimal, Decimal]:
+        # Placeholder: identity mapping.
+        self._cached_in = out_req
+        self._cached_out = out_req
+        return self._cached_in, self._cached_out
+
+    def fwd(self, sandbox: "PaymentSandbox", in_cap: Decimal) -> Tuple[Decimal, Decimal]:
+        # Placeholder pass‑through.
+        self._cached_in = in_cap
+        self._cached_out = in_cap
+        return self._cached_in, self._cached_out
+
+    def quality_upper_bound(self) -> Decimal:
+        return Decimal(1)
+
