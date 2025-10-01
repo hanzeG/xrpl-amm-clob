@@ -16,6 +16,7 @@ def geq_with_tol(x: Decimal, y: Decimal) -> bool:
 import pytest
 
 from xrpl_router.exec_modes import run_trade_mode, ExecutionMode
+from xrpl_router.amm_context import AMMContext
 
 
 # Slippage monotonicity — per-test whitepaper mapping lives above each test.
@@ -70,18 +71,19 @@ def test_slippage_monotonic_clob_only(clob_segments_default, sizes):
 @pytest.mark.parametrize("sizes", [
     [Decimal("10"), Decimal("20"), Decimal("40"), Decimal("80"), Decimal("160"), Decimal("320")],
 ])
-def test_slippage_monotonic_amm_only_dense(clob_segments_default, amm_curve_real, amm_ctx_multipath, sizes):
+def test_slippage_monotonic_amm_only_dense(clob_segments_default, amm_curve_real, sizes):
     """
     Defaults (fixtures): AMM reserves x≈1000 (XRP grid=1e-6), y≈2000 (IOU grid=1e-15), fee≈0.003, no transfer fees; curve is sliced starting at ~5% of target per iteration. This test also enforces the strict whitepaper property: within each route, marginal (per-iteration) price is non-decreasing.
     """
     slips = []
     for q in sizes:
+        ctx = AMMContext(False)
         res = run_trade_mode(
             ExecutionMode.AMM_ONLY,
             target_out=q,
             segments=clob_segments_default,  # ignored in AMM_ONLY
             amm_curve=amm_curve_real,
-            amm_context=amm_ctx_multipath,
+            amm_context=ctx,
         )
         er = res.report
         assert er is not None
@@ -94,12 +96,13 @@ def test_slippage_monotonic_amm_only_dense(clob_segments_default, amm_curve_real
         assert geq_with_tol(s, Decimal(0))
     # Strict whitepaper property: within each route (fixed q), marginal (per-iteration) price is non-decreasing.
     for q in sizes:
+        ctx = AMMContext(False)
         res_q = run_trade_mode(
             ExecutionMode.AMM_ONLY,
             target_out=q,
             segments=clob_segments_default,  # ignored in AMM_ONLY
             amm_curve=amm_curve_real,
-            amm_context=amm_ctx_multipath,
+            amm_context=ctx,
         )
         er_q = res_q.report
         assert er_q is not None
@@ -123,7 +126,6 @@ def test_slippage_monotonic_hybrid_tier_anchored(
     clob_segments_default,
     amm_curve_real,
     amm_anchor_real,
-    amm_ctx_multipath,
     sizes,
 ):
     """
@@ -132,13 +134,14 @@ def test_slippage_monotonic_hybrid_tier_anchored(
     # Test avg_price monotonicity under hybrid anchoring per §1.2.4, §1.2.5, §1.2.7.2.
     slips = []
     for q in sizes:
+        ctx = AMMContext(False)
         res = run_trade_mode(
             ExecutionMode.HYBRID,
             target_out=q,
             segments=clob_segments_default,
             amm_curve=amm_curve_real,
             amm_anchor=amm_anchor_real,
-            amm_context=amm_ctx_multipath,
+            amm_context=ctx,
         )
         er = res.report
         assert er is not None
@@ -151,13 +154,14 @@ def test_slippage_monotonic_hybrid_tier_anchored(
         assert geq_with_tol(s, Decimal(0))
     # Strict property under LOB anchoring: within each route, marginal prices should be non-decreasing.
     for q in sizes:
+        ctx = AMMContext(False)
         res_q = run_trade_mode(
             ExecutionMode.HYBRID,
             target_out=q,
             segments=clob_segments_default,
             amm_curve=amm_curve_real,
             amm_anchor=amm_anchor_real,
-            amm_context=amm_ctx_multipath,
+            amm_context=ctx,
         )
         er_q = res_q.report
         assert er_q is not None

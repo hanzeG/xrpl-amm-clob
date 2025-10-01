@@ -48,7 +48,7 @@ class FakeAMM:
 @pytest.fixture()
 def amm_ctx_multipath() -> AMMContext:
     ctx = AMMContext(False)
-    ctx.set_multi_path(True)
+    ctx.setMultiPath(True)
     return ctx
 
 
