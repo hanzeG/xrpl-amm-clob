@@ -21,130 +21,6 @@ from xrpl_router.flow import flow as flow_execute
 # - amm_anchor_real
 
 
-# §1.2.4 / §1.2.5 — Alice → Carol: single-path CLOB payment
-# Intent: only CLOB is available; average price is non-negative; route executes end-to-end.
-# Note: run_trade_mode encapsulates rev/fwd passes for this experiment-style check.
-@pytest.mark.parametrize("amount", [Decimal("20"), Decimal("50")])
-def test_wp_alice_to_carol_clob_only(clob_segments_default, amount):
-    print("[WP §1.2.4/§1.2.5] Alice→Carol via CLOB_ONLY, amount=", amount)
-    res = run_trade_mode(
-        ExecutionMode.CLOB_ONLY,
-        target_out=amount,
-        segments=clob_segments_default,
-    )
-    er = res.report
-    assert er is not None
-    assert er.total_out > 0
-    assert er.avg_price >= 0
-    print(f"  -> mode=CLOB_ONLY | out_req={_fmt(amount)} | filled={_fmt(er.total_out)} | avg_price={_fmt(er.avg_price)}")
-
-
-# §1.2.7.1 — Bob uses AMM: single-path swap (no Fibonacci slicing)
-# We keep AMMContext single-path to reflect whitepaper: Fibonacci is for multi-path.
-@pytest.mark.parametrize("amount", [Decimal("20"), Decimal("80"), Decimal("160")])
-def test_wp_bob_amm_single_path(amm_curve_real, clob_segments_default, amount):
-    print("[WP §1.2.7.1] Bob via AMM_ONLY single-path, amount=", amount)
-    ctx = AMMContext(False)  # single-path
-    res = run_trade_mode(
-        ExecutionMode.AMM_ONLY,
-        target_out=amount,
-        segments=clob_segments_default,  # ignored in AMM_ONLY
-        amm_curve=amm_curve_real,
-        amm_context=ctx,
-    )
-    er = res.report
-    assert er is not None and er.total_out > 0
-    # Marginal prices per iteration should be non-decreasing within the route.
-    marginals = [it.price_effective for it in er.iterations if it.out_filled > 0]
-    for a, b in zip(marginals, marginals[1:]):
-        assert b >= a
-    print(f"  -> mode=AMM_ONLY(single-path) | out_req={_fmt(amount)} | filled={_fmt(er.total_out)} | avg_price={_fmt(er.avg_price)}")
-    _m = [it.price_effective for it in er.iterations if it.out_filled > 0]
-    _m_show = ','.join(_fmt(m) for m in _m[:3])
-    print(f"     marginals[0:3]={_m_show} (non-decreasing expected)")
-
-
-# §1.2.7.2 — Coexistence at equal quality: prefer CLOB
-# We anchor AMM at (or infinitesimally below) the LOB top quality; only CLOB should be consumed.
-@pytest.mark.parametrize("amount", [Decimal("40")])
-def test_wp_coexistence_prefer_clob(clob_segments_default, amm_anchor_real, amount):
-    print("[WP §1.2.7.2] CLOB vs AMM coexistence at equal quality (prefer CLOB), amount=", amount)
-    ctx = AMMContext(False)  # single-path enough; tie-break prefers CLOB
-    res = run_trade_mode(
-        ExecutionMode.HYBRID,
-        target_out=amount,
-        segments=clob_segments_default,
-        amm_anchor=amm_anchor_real,
-        amm_context=ctx,
-    )
-    er = res.report
-    assert er is not None and er.total_out > 0
-    # AMM not used → counter stays zero (tie-break prefers CLOB)
-    assert ctx.ammUsedIters == 0
-    # Match CLOB-only outcome at this amount (within numerical tolerance)
-    res_clob = run_trade_mode(
-        ExecutionMode.CLOB_ONLY,
-        target_out=amount,
-        segments=clob_segments_default,
-    )
-    er_clob = res_clob.report
-    assert er_clob is not None
-    # total_out must match; avg_price equal within tiny tolerance
-    assert er.total_out == er_clob.total_out
-    diff = (er.avg_price - er_clob.avg_price).copy_abs()
-    assert diff <= Decimal("1e-12")
-    print(
-        "  -> HYBRID(tie) vs CLOB_ONLY | out_req=" + _fmt(amount) +
-        " | hybrid(filled=" + _fmt(er.total_out) + ", avg=" + _fmt(er.avg_price) + ")" +
-        " | clob_only(filled=" + _fmt(er_clob.total_out) + ", avg=" + _fmt(er_clob.avg_price) + ")"
-    )
-
-
-# §1.2.7.3 — Multi-path with Fibonacci sizing (advance only when AMM consumed; ≤ 30)
-# Here we explicitly enable multi-path flag in AMMContext to reflect the whitepaper setting.
-def test_wp_multipath_fibonacci(clob_segments_default, amm_anchor_real):
-    print("[WP §1.2.7.3] Multi-path with Fibonacci sizing (HYBRID), target_out=", end="")
-    ctx = AMMContext(False)
-    ctx.setMultiPath(True)  # enable whitepaper multi-path semantics
-    clob_total = sum(seg.out_max for seg in clob_segments_default)
-    amount = clob_total + Decimal("10")  # ensure CLOB alone cannot satisfy
-    print(amount)
-
-    def competitive_amm_curve(target_out: Decimal):
-        amm = AMM(
-            x_reserve=Decimal("5000"),
-            y_reserve=Decimal("5000"),  # SPQ ≈ 1.0 to be competitive with LOB top
-            fee=Decimal("0.003"),
-            x_is_xrp=True,
-            y_is_xrp=False,
-            tr_in=Decimal("0"),
-            tr_out=Decimal("0"),
-        )
-        return list(amm.segments_for_out(target_out, max_segments=30, start_fraction=Decimal("5e-2")))
-
-    res = run_trade_mode(
-        ExecutionMode.HYBRID,
-        target_out=amount,
-        segments=clob_segments_default,
-        amm_curve=competitive_amm_curve,
-        amm_anchor=amm_anchor_real,
-        amm_context=ctx,
-    )
-    er = res.report
-    assert er is not None and er.total_out > 0
-    # Hybrid should fill beyond pure CLOB capacity if AMM contributes
-    clob_cap = sum(seg.out_max for seg in clob_segments_default)
-    assert er.total_out + Decimal("1e-12") >= clob_cap  # at least reach cap (tolerate rounding)
-    assert er.total_out > clob_cap - Decimal("1e-9")   # and be effectively at/above cap
-    print(
-        "  -> HYBRID(multipath) | out_req=" + _fmt(amount) +
-        " | clob_cap=" + _fmt(clob_cap) +
-        " | filled=" + _fmt(er.total_out) +
-        " (expect ≥ clob_cap; AMM provides remainder)"
-    )
-
-
-
 
 # §1.2.1 — Reverse-only suffices (no forward replay needed)
 def test_wp_reverse_only_no_forward(clob_segments_default):
@@ -207,6 +83,8 @@ def test_wp_sendmax_forces_forward_and_partial(clob_segments_default):
 #     # Corresponding input should also be ≈2 (all qualities are 1)
 #     assert (actual_in - Decimal("2")).copy_abs() <= Decimal("1e-9")
 #     print(f"  -> out_req=10 | delivered={_fmt(actual_out)} | cost={_fmt(actual_in)} (limited by EUR/CAN)")
+
+
 
 # §1.2.4 — Same-quality CLOB offers merged within one iteration
 def test_wp_same_quality_merged_single_iteration():
@@ -274,29 +152,51 @@ def test_wp_pure_clob_multipath_switch():
     # Since B has large capacity and high quality, most of the fill should come from B; for finer switching, track source in BookStep fee_hook.
     print(f"  -> delivered={_fmt(actual_out)} | cost={_fmt(actual_in)} (dominant path chosen by quality)")
 
-# §1.2.7.2 — Dynamic switch: AMM first, then CLOB after tie
-def test_wp_dynamic_amm_then_clob(clob_segments_default, amm_anchor_real):
-    print("[WP §1.2.7.2] Dynamic switch: AMM first, then CLOB after tie.")
-    # Let the AMM anchor initially be slightly better than the LOB top, but with a small cap; then revert to CLOB
-    ctx = AMMContext(False)
-    amount = Decimal("60")
+
+
+# §1.2.4 / §1.2.5 — Alice → Carol: single-path CLOB payment
+# Intent: only CLOB is available; average price is non-negative; route executes end-to-end.
+# Note: run_trade_mode encapsulates rev/fwd passes for this experiment-style check.
+@pytest.mark.parametrize("amount", [Decimal("20"), Decimal("50")])
+def test_wp_alice_to_carol_clob_only(clob_segments_default, amount):
+    print("[WP §1.2.4/§1.2.5] Alice→Carol via CLOB_ONLY, amount=", amount)
     res = run_trade_mode(
-        ExecutionMode.HYBRID,
+        ExecutionMode.CLOB_ONLY,
         target_out=amount,
         segments=clob_segments_default,
-        amm_anchor=amm_anchor_real,  # fixture: generates an anchored slice just below or at LOB top
+    )
+    er = res.report
+    assert er is not None
+    assert er.total_out > 0
+    assert er.avg_price >= 0
+    print(f"  -> mode=CLOB_ONLY | out_req={_fmt(amount)} | filled={_fmt(er.total_out)} | avg_price={_fmt(er.avg_price)}")
+
+
+# §1.2.7.1 — Bob uses AMM: single-path swap (no Fibonacci slicing)
+# We keep AMMContext single-path to reflect whitepaper: Fibonacci is for multi-path.
+@pytest.mark.parametrize("amount", [Decimal("20"), Decimal("80"), Decimal("160")])
+def test_wp_bob_amm_single_path(amm_curve_real, clob_segments_default, amount):
+    print("[WP §1.2.7.1] Bob via AMM_ONLY single-path, amount=", amount)
+    ctx = AMMContext(False)  # single-path
+    res = run_trade_mode(
+        ExecutionMode.AMM_ONLY,
+        target_out=amount,
+        segments=clob_segments_default,  # ignored in AMM_ONLY
+        amm_curve=amm_curve_real,
         amm_context=ctx,
     )
     er = res.report
     assert er is not None and er.total_out > 0
-    # Expect AMM to be used at least once, then revert to CLOB (cannot directly observe the switch, so use counter as an approximation)
-    assert ctx.ammUsedIters >= 0  # Depending on anchor strategy, may be 0 or 1; keep this loose
-    # Compare to CLOB-only: after the AMM cap, hybrid should match CLOB-only result
-    res_clob = run_trade_mode(ExecutionMode.CLOB_ONLY, target_out=amount, segments=clob_segments_default)
-    er_clob = res_clob.report
-    assert er_clob is not None
-    assert (er.avg_price - er_clob.avg_price).copy_abs() <= Decimal("1e-6")
-    print(f"  -> hybrid.avg≈{_fmt(er.avg_price)} vs clob.avg≈{_fmt(er_clob.avg_price)} | ammIters={ctx.ammUsedIters}")
+    # Marginal prices per iteration should be non-decreasing within the route.
+    marginals = [it.price_effective for it in er.iterations if it.out_filled > 0]
+    for a, b in zip(marginals, marginals[1:]):
+        assert b >= a
+    print(f"  -> mode=AMM_ONLY(single-path) | out_req={_fmt(amount)} | filled={_fmt(er.total_out)} | avg_price={_fmt(er.avg_price)}")
+    _m = [it.price_effective for it in er.iterations if it.out_filled > 0]
+    _m_show = ','.join(_fmt(m) for m in _m[:3])
+    print(f"     marginals[0:3]={_m_show} (non-decreasing expected)")
+    
+
 
 # §1.2.7.1 — Two consecutive AMM-only trades: second one pricier (pool state is updated)
 def test_wp_amm_two_trades_second_pricier():
@@ -324,6 +224,117 @@ def test_wp_amm_two_trades_second_pricier():
     assert r1.report is not None and r2.report is not None
     assert r2.report.avg_price >= r1.report.avg_price - Decimal("1e-12")
     print(f"  -> avg1={_fmt(r1.report.avg_price)} | avg2={_fmt(r2.report.avg_price)} (non-decreasing)")
+
+
+# §1.2.7.2 — Coexistence at equal quality: prefer CLOB
+# We anchor AMM at (or infinitesimally below) the LOB top quality; only CLOB should be consumed.
+@pytest.mark.parametrize("amount", [Decimal("40")])
+def test_wp_coexistence_prefer_clob(clob_segments_default, amm_anchor_real, amount):
+    print("[WP §1.2.7.2] CLOB vs AMM coexistence at equal quality (prefer CLOB), amount=", amount)
+    ctx = AMMContext(False)  # single-path enough; tie-break prefers CLOB
+    res = run_trade_mode(
+        ExecutionMode.HYBRID,
+        target_out=amount,
+        segments=clob_segments_default,
+        amm_anchor=amm_anchor_real,
+        amm_context=ctx,
+    )
+    er = res.report
+    assert er is not None and er.total_out > 0
+    # AMM not used → counter stays zero (tie-break prefers CLOB)
+    assert ctx.ammUsedIters == 0
+    # Match CLOB-only outcome at this amount (within numerical tolerance)
+    res_clob = run_trade_mode(
+        ExecutionMode.CLOB_ONLY,
+        target_out=amount,
+        segments=clob_segments_default,
+    )
+    er_clob = res_clob.report
+    assert er_clob is not None
+    # total_out must match; avg_price equal within tiny tolerance
+    assert er.total_out == er_clob.total_out
+    diff = (er.avg_price - er_clob.avg_price).copy_abs()
+    assert diff <= Decimal("1e-12")
+    print(
+        "  -> HYBRID(tie) vs CLOB_ONLY | out_req=" + _fmt(amount) +
+        " | hybrid(filled=" + _fmt(er.total_out) + ", avg=" + _fmt(er.avg_price) + ")" +
+        " | clob_only(filled=" + _fmt(er_clob.total_out) + ", avg=" + _fmt(er_clob.avg_price) + ")"
+    )
+
+
+
+# §1.2.7.2 — Dynamic switch: AMM first, then CLOB after tie
+def test_wp_dynamic_amm_then_clob(clob_segments_default, amm_anchor_real):
+    print("[WP §1.2.7.2] Dynamic switch: AMM first, then CLOB after tie.")
+    # Let the AMM anchor initially be slightly better than the LOB top, but with a small cap; then revert to CLOB
+    ctx = AMMContext(False)
+    amount = Decimal("60")
+    res = run_trade_mode(
+        ExecutionMode.HYBRID,
+        target_out=amount,
+        segments=clob_segments_default,
+        amm_anchor=amm_anchor_real,  # fixture: generates an anchored slice just below or at LOB top
+        amm_context=ctx,
+    )
+    er = res.report
+    assert er is not None and er.total_out > 0
+    # Expect AMM to be used at least once, then revert to CLOB (cannot directly observe the switch, so use counter as an approximation)
+    assert ctx.ammUsedIters >= 0  # Depending on anchor strategy, may be 0 or 1; keep this loose
+    # Compare to CLOB-only: after the AMM cap, hybrid should match CLOB-only result
+    res_clob = run_trade_mode(ExecutionMode.CLOB_ONLY, target_out=amount, segments=clob_segments_default)
+    er_clob = res_clob.report
+    assert er_clob is not None
+    assert (er.avg_price - er_clob.avg_price).copy_abs() <= Decimal("1e-6")
+    print(f"  -> hybrid.avg≈{_fmt(er.avg_price)} vs clob.avg≈{_fmt(er_clob.avg_price)} | ammIters={ctx.ammUsedIters}")
+
+
+
+
+# §1.2.7.3 — Multi-path with Fibonacci sizing (advance only when AMM consumed; ≤ 30)
+# Here we explicitly enable multi-path flag in AMMContext to reflect the whitepaper setting.
+def test_wp_multipath_fibonacci(clob_segments_default, amm_anchor_real):
+    print("[WP §1.2.7.3] Multi-path with Fibonacci sizing (HYBRID), target_out=", end="")
+    ctx = AMMContext(False)
+    ctx.setMultiPath(True)  # enable whitepaper multi-path semantics
+    clob_total = sum(seg.out_max for seg in clob_segments_default)
+    amount = clob_total + Decimal("10")  # ensure CLOB alone cannot satisfy
+    print(amount)
+
+    def competitive_amm_curve(target_out: Decimal):
+        amm = AMM(
+            x_reserve=Decimal("5000"),
+            y_reserve=Decimal("5000"),  # SPQ ≈ 1.0 to be competitive with LOB top
+            fee=Decimal("0.003"),
+            x_is_xrp=True,
+            y_is_xrp=False,
+            tr_in=Decimal("0"),
+            tr_out=Decimal("0"),
+        )
+        return list(amm.segments_for_out(target_out, max_segments=30, start_fraction=Decimal("5e-2")))
+
+    res = run_trade_mode(
+        ExecutionMode.HYBRID,
+        target_out=amount,
+        segments=clob_segments_default,
+        amm_curve=competitive_amm_curve,
+        amm_anchor=amm_anchor_real,
+        amm_context=ctx,
+    )
+    er = res.report
+    assert er is not None and er.total_out > 0
+    # Hybrid should fill beyond pure CLOB capacity if AMM contributes
+    clob_cap = sum(seg.out_max for seg in clob_segments_default)
+    assert er.total_out + Decimal("1e-12") >= clob_cap  # at least reach cap (tolerate rounding)
+    assert er.total_out > clob_cap - Decimal("1e-9")   # and be effectively at/above cap
+    print(
+        "  -> HYBRID(multipath) | out_req=" + _fmt(amount) +
+        " | clob_cap=" + _fmt(clob_cap) +
+        " | filled=" + _fmt(er.total_out) +
+        " (expect ≥ clob_cap; AMM provides remainder)"
+    )
+
+
+
 
 # §1.2.7.3 — Fibonacci discipline: advance only on AMM use; cap ≤ 30
 def test_wp_multipath_fibonacci_discipline(clob_segments_default, amm_anchor_real):
