@@ -24,3 +24,21 @@ build/
 .coverage
 htmlcov/
 .cache/
+
+# Linters / type checkers
+.ruff_cache/
+.hypothesis/
+
+# Test/bench artefacts
+.benchmarks/
+coverage.xml
+
+# CI/tools
+.tox/
+.nox/
+pip-wheel-metadata/
+.pyre/
+.pytype/
+
+# Python version managers
+.python-version

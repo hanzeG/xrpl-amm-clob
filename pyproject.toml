@@ -18,12 +18,14 @@ include = ["xrpl_router*"] # import package name and subpackages
 package-dir = { "" = "src" } # top-level package directory points to src
 
 [tool.pytest.ini_options]
-addopts = "-q -ra --strict-markers --disable-warnings"
+# addopts = "-q -ra --strict-markers --disable-warnings --cov=src/xrpl_router --cov-report=term-missing --cov-fail-under=0"
+addopts = "-q -s"
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+src = ["src"]
 select = ["E", "F", "I", "B", "UP", "SIM", "PL", "RUF"]
 ignore = ["E203"]
 
@@ -36,3 +38,5 @@ python_version = "3.11"
 strict = true
 warn_unused_ignores = true
 disallow_untyped_defs = true
+mypy_path = ["src"]
+ignore_missing_imports = true

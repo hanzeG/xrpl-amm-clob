@@ -3,7 +3,7 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.11
+  - python=3.11.*
   - pip
   - matplotlib
   - numpy
@@ -12,6 +12,8 @@ dependencies:
   - seaborn
   - pytest
   - pytest-cov
+  - pytest-xdist
+  - pre-commit
   - hypothesis
   - mypy
   - ruff
