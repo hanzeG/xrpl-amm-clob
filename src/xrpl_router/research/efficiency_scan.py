@@ -14,16 +14,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Iterable, List, Optional, Callable, Sequence, Tuple, Dict
+from enum import Enum
 
-
-from .core import Segment, RouteResult, ExecutionReport, ROUTING_CFG, PRICE_EPS
-from .exec_modes import run_trade_mode, ExecutionMode
+from ..core import Segment, RouteResult, ExecutionReport, ROUTING_CFG, PRICE_EPS
 # Hybrid flow/step imports
-from .amm_context import AMMContext
-from .amm import AMM
+from ..amm_context import AMMContext
+from ..amm import AMM
 # Hybrid flow/step imports
-from .flow import PaymentSandbox, flow
-from .steps import Step
+from ..flow import PaymentSandbox, flow
+from ..steps import Step
 
 # Upper bound target used when enforcing an *input* cap in Step.fwd()
 # We request a very large OUT and let send_max cap the actual spend,
@@ -140,6 +139,41 @@ def _zero_route_result() -> RouteResult:
     return RouteResult(
         filled_out=Decimal(0),
         spent_in=Decimal(0),
+        avg_quality=Decimal(0),
+        usage={},
+        trace=[],
+        report=er,
+    )
+
+
+# --- Minimal ExecutionMode and run_trade_mode for research helpers ---
+class ExecutionMode(Enum):
+    """Lightweight execution mode enum used locally for research helpers."""
+    CLOB_ONLY = "CLOB_ONLY"
+    AMM_ONLY = "AMM_ONLY"
+
+def _mk_route_result(spent_in: Decimal, filled_out: Decimal) -> RouteResult:
+    """Construct a minimal RouteResult with an attached ExecutionReport.
+
+    This keeps downstream summarizers working without depending on research.exec_modes.
+    """
+    avg_price = (spent_in / filled_out) if filled_out > 0 else Decimal(0)
+    er = ExecutionReport(
+        iterations=[],
+        total_out=filled_out,
+        total_in=spent_in,
+        avg_price=avg_price,
+        avg_quality=Decimal(0),
+        filled_ratio=Decimal(1) if filled_out > 0 else Decimal(0),
+        in_budget_ratio=Decimal(0),
+        fee_pool_total=Decimal(0),
+        fee_tr_in_total=Decimal(0),
+        fee_tr_out_total=Decimal(0),
+        slippage_price_avg=Decimal(0),
+    )
+    return RouteResult(
+        filled_out=filled_out,
+        spent_in=spent_in,
         avg_quality=Decimal(0),
         usage={},
         trace=[],
@@ -698,6 +732,54 @@ class _AmmStepForHybrid(Step):
         if self._amm_context is not None and self._cached_out > 0:
             self._amm_context.setAMMUsed()
         return self._cached_in, self._cached_out
+
+
+def run_trade_mode(
+    mode: ExecutionMode,
+    *,
+    target_out: Decimal,
+    segments: List[Segment] | Iterable[Segment],
+    send_max: Optional[Decimal] = None,
+    deliver_min: Optional[Decimal] = None,  # currently unused; flow() is driven by out_req
+    limit_quality: Optional[Decimal] = None,
+    amm_anchor: Optional[Callable[[Decimal, Decimal], Optional[Segment]]] = None,
+    amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]] = None,
+    amm_context: Optional[AMMContext] = None,
+    apply_sink: Optional[Callable[[Decimal, Decimal], None]] = None,
+) -> RouteResult:
+    """Minimal single-leg executor for research analysis.
+
+    Implements AMM-only and CLOB-only runs using the production `flow()` engine
+    with a single Step strand. Returns a synthetic RouteResult with totals.
+    """
+    sb = PaymentSandbox()
+    if mode is ExecutionMode.CLOB_ONLY:
+        segs_list = list(segments)
+        step = _ClobStepForHybrid(lambda: segs_list, limit_quality=limit_quality, meter={}, clob_cap=None)
+        total_in, total_out = flow(
+            sb,
+            strands=[[step]],
+            out_req=target_out,
+            send_max=send_max,
+            limit_quality=limit_quality,
+            amm_context=None,
+            apply_sink=None,
+        )
+        return _mk_route_result(total_in, total_out)
+    elif mode is ExecutionMode.AMM_ONLY:
+        step = _AmmStepForHybrid(amm_anchor, amm_curve, amm_context=amm_context, limit_quality=limit_quality, meter={}, apply_sink=apply_sink)
+        total_in, total_out = flow(
+            sb,
+            strands=[[step]],
+            out_req=target_out,
+            send_max=send_max,
+            limit_quality=limit_quality,
+            amm_context=amm_context,
+            apply_sink=apply_sink,
+        )
+        return _mk_route_result(total_in, total_out)
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
 
 
 def hybrid_flow(
