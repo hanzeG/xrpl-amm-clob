@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from xrpl_router.efficiency_scan import hybrid_flow
+from xrpl_router.research.efficiency_scan import hybrid_flow
 from xrpl_router.amm_context import AMMContext
 from xrpl_router.core import Segment
 

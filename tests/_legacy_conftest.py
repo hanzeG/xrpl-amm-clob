@@ -1,5 +1,4 @@
 from __future__ import annotations
-import math
 from decimal import Decimal
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -15,7 +14,6 @@ from xrpl_router.amm import AMM, amm_curve_from_linear, amm_anchor_from_discount
 # -----------------------------
 # Test helpers (pure functions)
 # -----------------------------
-
 
 class FakeAMM:
     """Minimal AMM stub exposing preview_fees_for_fill for fee-metering tests.

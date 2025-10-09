@@ -8,8 +8,8 @@ def leq_with_tol(x: Decimal, y: Decimal) -> bool:
 
 import pytest
 
-from xrpl_router.exec_modes import run_trade_mode, ExecutionMode
-from xrpl_router.efficiency_scan import hybrid_flow
+from xrpl_router.research import run_trade_mode, ExecutionMode
+from xrpl_router.research.efficiency_scan import hybrid_flow
 
 from xrpl_router.clob import make_ladder, normalise_segments
 

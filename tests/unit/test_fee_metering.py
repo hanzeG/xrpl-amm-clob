@@ -2,8 +2,8 @@ from decimal import Decimal
 
 import pytest
 
-from xrpl_router.exec_modes import run_trade_mode, ExecutionMode
-from xrpl_router.efficiency_scan import hybrid_flow, summarize_hybrid
+from xrpl_router.research import run_trade_mode, ExecutionMode
+from xrpl_router.research.efficiency_scan import hybrid_flow, summarize_hybrid
 
 
 # ---------------------------

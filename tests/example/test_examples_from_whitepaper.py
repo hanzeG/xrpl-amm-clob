@@ -7,7 +7,7 @@ def _fmt(x: Decimal) -> str:
     return format(x, '.9f')
 import pytest
 
-from xrpl_router.exec_modes import run_trade_mode, ExecutionMode
+from xrpl_router.research import run_trade_mode, ExecutionMode
 from xrpl_router.amm_context import AMMContext
 from xrpl_router.book_step import BookStep
 from xrpl_router.flow import PaymentSandbox
@@ -83,8 +83,6 @@ def test_wp_sendmax_forces_forward_and_partial(clob_segments_default):
 #     # Corresponding input should also be ≈2 (all qualities are 1)
 #     assert (actual_in - Decimal("2")).copy_abs() <= Decimal("1e-9")
 #     print(f"  -> out_req=10 | delivered={_fmt(actual_out)} | cost={_fmt(actual_in)} (limited by EUR/CAN)")
-
-
 
 # §1.2.4 — Same-quality CLOB offers merged within one iteration
 def test_wp_same_quality_merged_single_iteration():
