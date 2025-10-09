@@ -1,15 +1,20 @@
-
-
 """
 XRPL Router Core
-================
+==================
 
-Unified exports for core primitives and utilities aligned with rippled semantics.
-This module re-exports stable APIs from submodules for convenient imports.
+Unified exports for integer-domain primitives and utilities aligned with rippled semantics.
+All arithmetic follows XRPL-style STAmount normalisation and rounding rules.
+Decimal helpers are provided *only* for I/O formatting.
 
 Numerical convention: IOU STAmount encodes values as mantissa * 10^exponent with
 mantissa in [1e15, 1e16-1]. XRP uses integer drops at the I/O boundary.
 """
+
+# NOTE:
+#   The `core` package defines the integer-domain primitives and arithmetic used
+#   across the router. All computations are performed on STAmount and Quality objects
+#   following XRPL ledger rules for mantissa/exponent scaling, rounding, and normalization.
+#   Decimal functions exist only for I/O formatting and display.
 
 # Integer-domain constants (rippled-aligned)
 from .constants import (
@@ -35,6 +40,11 @@ from .fmt import (
 from .amounts import (
     STAmount,
     st_from_drops,
+    drops_from_xrp_in,
+    drops_from_xrp_out,
+    xrp_from_drops,
+    round_in_min,
+    round_out_max,
 )
 
 # Quality (price-like ratio)
@@ -77,6 +87,11 @@ __all__ = [
     # amounts
     "STAmount",
     "st_from_drops",
+    "drops_from_xrp_in",
+    "drops_from_xrp_out",
+    "xrp_from_drops",
+    "round_in_min",
+    "round_out_max",
     # quality
     "Quality",
     # ordering

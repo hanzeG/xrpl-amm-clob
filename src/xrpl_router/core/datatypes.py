@@ -12,7 +12,7 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Literal
 
 from .amounts import STAmount
 from .quality import Quality
@@ -24,26 +24,26 @@ from .quality import Quality
 
 @dataclass(frozen=True)
 class Segment:
-    """A single executable segment/offer with a quoted slice quality.
+    """Router segment on a single slice/source (integer domain).
 
     Fields:
-    - id: stable insertion index for deterministic tie-breaking.
-    - quality: quoted/bucketed quality (higher is better).
-    - out_max: the maximum OUT the segment can deliver for the current slice.
-    - in_at_out_max: the IN required (ceiled) at `out_max`.
-    - in_is_xrp / out_is_xrp: flags for caller-side bridging decisions.
-
-    The pair (in_at_out_max, out_max) must be non-zero and of compatible types
-    when used in arithmetic. XRP-side IN/OUT handling is performed by callers
-    that know the asset context.
+    - src: source type tag ("AMM" or "CLOB"). Used for tie-breaks and AMM-residual rules.
+    - quality: quoted OUT/IN quality (higher is better). Integer-domain Quality.
+    - out_max: maximum OUT available on this slice (STAmount).
+    - in_at_out_max: IN required to exhaust out_max at quoted quality (STAmount).
+    - in_is_xrp/out_is_xrp: asset type flags for I/O boundary handling (display/bridges).
+    - raw_quality: optional raw quality as originated by the source (often same as quality).
+    - source_id: optional identifier for bookkeeping/debugging.
     """
 
-    id: int
+    src: Literal["AMM", "CLOB"]
     quality: Quality
     out_max: STAmount
     in_at_out_max: STAmount
     in_is_xrp: bool = False
     out_is_xrp: bool = False
+    raw_quality: Optional[Quality] = None
+    source_id: Optional[str] = None
 
     def is_usable(self) -> bool:
         """Return True if the segment can be taken for a positive slice."""

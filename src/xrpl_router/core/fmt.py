@@ -6,6 +6,11 @@ formatting and convenience (e.g., tests, logs, display).
 """
 
 from decimal import Decimal, getcontext
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .amounts import STAmount  # pragma: no cover
+    from .quality import Quality   # pragma: no cover
 
 # ---------------------------------------------------------------------------
 # Global Decimal precision (formatting only)
@@ -49,6 +54,40 @@ def fmt_dec(x: Decimal, places: int = 18) -> str:
     return format(x, f".{places}E")
 
 
+# ---------------------------------------------------------------------------
+# Logging/display conversion helpers for STAmount and Quality
+# ---------------------------------------------------------------------------
+
+def amount_to_decimal(a: Any) -> Decimal:
+    """Convert an integer-domain STAmount into a Decimal for logging/printing only."""
+    if a is None or getattr(a, "mantissa", 0) == 0 or getattr(a, "sign", 1) <= 0:
+        return Decimal(0)
+    m = getattr(a, "mantissa", 0)
+    e = getattr(a, "exponent", 0)
+    s = getattr(a, "sign", 1)
+    val = Decimal(m) * (Decimal(10) ** e)
+    return val if s >= 0 else -val
+
+def quality_rate_to_decimal(q: Any) -> Decimal:
+    """Return Decimal form of taker quality (OUT/IN)."""
+    if q is None or getattr(q, "rate", None) is None:
+        return Decimal(0)
+    r = q.rate
+    m = getattr(r, "mantissa", None)
+    e = getattr(r, "exponent", None)
+    if m is None or e is None:
+        try:
+            return Decimal(str(r))
+        except Exception:
+            return Decimal(0)
+    return Decimal(m) * (Decimal(10) ** e)
+
+def quality_price_to_decimal(q: Any) -> Decimal:
+    """Return Decimal price (IN/OUT) as the reciprocal of Quality.rate, for display only."""
+    r = quality_rate_to_decimal(q)
+    return Decimal(0) if r <= 0 else (Decimal(1) / r)
+
+
 __all__ = [
     "DEFAULT_DECIMAL_PRECISION",
     "XRP_QUANTUM",
@@ -56,4 +95,7 @@ __all__ = [
     "QUALITY_QUANTUM",
     "DEFAULT_QUANTUM",
     "fmt_dec",
+    "amount_to_decimal",
+    "quality_rate_to_decimal",
+    "quality_price_to_decimal",
 ]

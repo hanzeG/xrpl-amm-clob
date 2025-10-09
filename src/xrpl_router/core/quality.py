@@ -88,16 +88,16 @@ class Quality:
 
     # Ordering: higher rate is better → invert natural __lt__ on STAmount.
     def __lt__(self, other: "Quality") -> bool:  # type: ignore[override]
-        return self.rate > other.rate
-
-    def __le__(self, other: "Quality") -> bool:  # type: ignore[override]
-        return self.rate >= other.rate
-
-    def __gt__(self, other: "Quality") -> bool:  # type: ignore[override]
         return self.rate < other.rate
 
-    def __ge__(self, other: "Quality") -> bool:  # type: ignore[override]
+    def __le__(self, other: "Quality") -> bool:  # type: ignore[override]
         return self.rate <= other.rate
+
+    def __gt__(self, other: "Quality") -> bool:  # type: ignore[override]
+        return self.rate > other.rate
+
+    def __ge__(self, other: "Quality") -> bool:  # type: ignore[override]
+        return self.rate >= other.rate
 
     def is_zero(self) -> bool:
         return self.rate.is_zero()
