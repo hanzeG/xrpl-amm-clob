@@ -15,187 +15,251 @@ Status:
   slices via anchoring or curve as needed and drops AMM residuals across iterations.
   Forward execution also stages AMM pool deltas (dx, dy) into the sandbox; Flow.apply()
   later commits them via apply_sink. Reverse pass remains read-only.
-  Additionally, the default_fee_hook stages CLOB out-side issuer fees into the sandbox; rev remains read-only.
+  An optional fee_hook may stage issuer out-side fees into the sandbox; by default no fee is applied.
   Production code should use BookStep; the legacy router remains for research tooling.
 """
 from __future__ import annotations
 
-def default_fee_hook(trace: List[Dict[str, Any]], sandbox: "PaymentSandbox") -> None:
-    """Default execution‑time fee accounting per whitepaper §1.3.2.4.
-
-    For CLOB slices, compute issuer out‑side fee and stage it into the sandbox.
-    Placeholder logic: apply a flat 0.1% fee on take_out for demonstration.
-    """
-    FEE_RATE = Decimal("0.001")
-    for item in trace:
-        if item.get("src") == "CLOB":
-            take_out = item.get("take_out", Decimal(0))
-            if take_out > 0:
-                fee = (take_out * FEE_RATE).quantize(Decimal("1e-12"))
-                if fee > 0:
-                    try:
-                        sandbox.stage_fee(Decimal(0), -fee)
-                    except Exception:
-                        continue
 
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Callable, Iterable, Optional, Tuple, List
 from typing import Any, Dict
+from .core.datatypes import Segment
+from .core.amounts import STAmount
+from .core.quality import Quality
+#
 
-from .core import (
-    Segment,
-    round_out_max,
-    round_in_min,
-    quality_bucket,
-    XRP_QUANTUM,
-    IOU_QUANTUM,
-    _guard_inst_quality,
-)
-# --- Whitepaper-aligned execution skeleton (to be filled in Batch 2) ---
+# --- Integer helpers for proportional allocation ---
+def _ten_pow(n: int) -> int:
+    return 10 ** n
+
+def _units_on_grid(amount: STAmount, target_exp: int) -> int:
+    """Return integer number of quanta (10^target_exp) contained in amount.
+    Requires amount.exponent >= target_exp. Caller ensures target_exp is min exponent across set.
+    """
+    shift = amount.exponent - target_exp
+    if shift < 0:
+        # Not representable without fraction; treat as zero units for safety
+        return 0
+    return amount.mantissa * _ten_pow(shift)
+
+def _alloc_proportional(cap_units: List[int], need_units: int) -> List[int]:
+    """Largest-remainder allocation of need_units proportionally to cap_units.
+    Returns integer allocations per index; sum == need_units and each <= cap.
+    """
+    total = sum(cap_units)
+    if total <= 0 or need_units <= 0:
+        return [0] * len(cap_units)
+    base = []
+    rems = []
+    acc = 0
+    for u in cap_units:
+        num = need_units * u
+        q, r = divmod(num, total)
+        if q > u:
+            q = u
+            r = 0
+        base.append(q)
+        rems.append(r)
+        acc += q
+    leftover = need_units - acc
+    if leftover > 0:
+        order = sorted(range(len(cap_units)), key=lambda k: rems[k], reverse=True)
+        for k in order:
+            if leftover <= 0:
+                break
+            if base[k] < cap_units[k]:
+                base[k] += 1
+                leftover -= 1
+    return base
+
+def _prefer_clob_on_ties(segs: Iterable[Segment]) -> List[Segment]:
+    seq = list(segs)
+    # Sort by quality rate (higher is better), tie-break: CLOB before AMM
+    return sorted(
+        seq,
+        key=lambda s: (
+            s.quality.rate.exponent,  # primary: exponent
+            s.quality.rate.mantissa,  # secondary: mantissa
+            0 if s.src != "AMM" else 1,  # CLOB first on ties
+        ),
+        reverse=True,
+    )
+
+def default_fee_hook(trace: List[Dict[str, Any]], sandbox: "PaymentSandbox") -> None:
+    """Demonstration-only fee hook: apply 0.1% out-side fee for CLOB slices.
+    Mutates sandbox with (dx, dy) where dy is negative (reducing OUT delivered).
+    NOTE: This hook is optional and off by default; production callers should
+    provide an explicit issuer-fee policy if needed.
+    """
+    # 0.1% = divide by 1000 (integer scalar division on STAmount)
+    for item in trace:
+        if item.get("src") == "CLOB":
+            take_out: STAmount = item.get("take_out", STAmount.zero())
+            if isinstance(take_out, STAmount) and not take_out.is_zero():
+                fee = take_out // 1000
+                if not fee.is_zero():
+                    # Construct a negative out-side fee explicitly in integer domain
+                    neg_fee = STAmount.from_components(fee.mantissa, fee.exponent, -1)
+                    try:
+                        sandbox.stage_fee(STAmount.zero(), neg_fee)
+                    except Exception:
+                        continue
 def _execute_one_iteration(
     segs: List[Segment],
     *,
-    target_out: Decimal,
-    send_max: Optional[Decimal],
-    limit_quality: Optional[Decimal],
-    amm_anchor: Optional[Callable[[Decimal, Decimal], Optional[Segment]]],
-    amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]],
-    ctx: Optional[AMMContext],
-) -> Tuple[Decimal, Decimal, List[Segment], bool, Optional[Decimal], Decimal, Decimal, List[Dict[str, Any]]]:
-    """Execute a **single** whitepaper iteration locally and return its outcome.
-    
+    target_out: STAmount,
+    send_max: Optional[STAmount],
+    limit_quality: Optional[Quality],
+    amm_anchor: Optional[Callable[[Quality, STAmount], Optional[Segment]]],
+    amm_curve: Optional[Callable[[STAmount], Iterable[Segment]]],
+    ctx: Optional["AMMContext"],
+) -> Tuple[STAmount, STAmount, List[Segment], bool, Optional[Quality], STAmount, STAmount, List[Dict[str, Any]]]:
+    """Execute a single iteration (integer domain).
+
     Returns:
-      (filled_out, spent_in, next_segments, amm_used, tier_bucket, trace)
-    Notes:
-      - Mirrors `path_builder.route` Phase A/B (proportional scaling + grid rounding + guard).
-      - AMM residuals are **not** carried across iterations (re-sourced next round).
-      - Caller is responsible for calling `ctx.setAMMUsed()` when `amm_used` is True.
+    (filled_out, spent_in, next_segments, amm_used, tier_quality, amm_dx, amm_dy, trace)
     """
     trace: List[Dict[str, Any]] = []
-    amm_dx = Decimal(0)  # input token sent into pool
-    amm_dy = Decimal(0)  # output token received from pool
+    ZERO = STAmount.zero()
+    amm_dx = ZERO
+    amm_dy = ZERO
     if not segs:
-        return Decimal(0), Decimal(0), [], False, None, amm_dx, amm_dy, trace
-    # Apply limit_quality if any
+        return ZERO, ZERO, [], False, None, amm_dx, amm_dy, trace
+
+    # Apply quality floor
     if limit_quality is not None:
-        qmin_bucket = quality_bucket(limit_quality)
-        segs = [s for s in segs if quality_bucket(s.quality) >= qmin_bucket]
+        segs = [s for s in segs if s.quality.rate >= limit_quality.rate]
         if not segs:
-            return Decimal(0), Decimal(0), [], False, None, amm_dx, amm_dy, trace
-    # Determine LOB top and optionally inject a synthetic AMM anchored slice
-    q_lob_top = max((s.quality for s in segs if s.src != "AMM"), default=Decimal(0))
+            return ZERO, ZERO, [], False, None, amm_dx, amm_dy, trace
+
+    # Determine CLOB top quality
+    q_lob_top: Optional[Quality] = None
+    for s in segs:
+        if s.src != "AMM":
+            if q_lob_top is None or s.quality.rate > q_lob_top.rate:
+                q_lob_top = s.quality
+
     iter_segs = list(segs)
     synth: Optional[Segment] = None
-    if q_lob_top > 0 and amm_anchor and (ctx is None or not ctx.maxItersReached()):
+    if q_lob_top is not None and amm_anchor and (ctx is None or not ctx.maxItersReached()):
         try:
             synth = amm_anchor(q_lob_top, target_out)
-        except TypeError:
+        except Exception:
             synth = None
         if synth is not None:
             iter_segs.append(synth)
-    elif q_lob_top == 0 and amm_curve is not None and (ctx is None or not ctx.maxItersReached()):
-        # No CLOB top → AMM self-pricing via curve segments
+    elif q_lob_top is None and amm_curve is not None and (ctx is None or not ctx.maxItersReached()):
         try:
             curve_segs = list(amm_curve(target_out))
-        except TypeError:
+        except Exception:
             curve_segs = []
-        curve_segs = [cs for cs in curve_segs if cs and cs.out_max > 0 and cs.in_at_out_max > 0 and cs.quality > 0]
-        iter_segs.extend(curve_segs)
+        iter_segs.extend([cs for cs in curve_segs if cs and not cs.out_max.is_zero() and not cs.in_at_out_max.is_zero() and cs.quality.rate.sign > 0])
+
     iter_segs = _prefer_clob_on_ties(iter_segs)
     if not iter_segs:
-        return Decimal(0), Decimal(0), [], False, None, amm_dx, amm_dy, trace
-    # Choose tier (anchor to LOB top bucket when synth is present)
-    if synth is not None and q_lob_top > 0:
-        tier_bucket = quality_bucket(q_lob_top)
-        tier = [s for s in iter_segs if (s is synth) or quality_bucket(s.quality) == tier_bucket]
+        return ZERO, ZERO, [], False, None, amm_dx, amm_dy, trace
+
+    # Choose tier (anchor to LOB top bucket when synth present): here we treat exact equality of rate
+    if synth is not None and q_lob_top is not None:
+        tier = [s for s in iter_segs if (s is synth) or (s.quality.rate == q_lob_top.rate)]
         rest = [s for s in iter_segs if s not in tier]
+        tier_quality = q_lob_top
     else:
-        tier_bucket = max(quality_bucket(s.quality) for s in iter_segs)
-        tier = [s for s in iter_segs if quality_bucket(s.quality) == tier_bucket]
-        rest = [s for s in iter_segs if quality_bucket(s.quality) != tier_bucket]
+        # pick max quality
+        best = max(iter_segs, key=lambda s: (s.quality.rate.exponent, s.quality.rate.mantissa))
+        tier_quality = best.quality
+        tier = [s for s in iter_segs if s.quality.rate == best.quality.rate]
+        rest = [s for s in iter_segs if s.quality.rate != best.quality.rate]
+
     if not tier:
-        return Decimal(0), Decimal(0), rest, False, None, amm_dx, amm_dy, trace
-    # Phase A: proportional ideal takes
-    need = target_out
-    tier_cap_out = sum(min(s.out_max, need) for s in tier)
-    if tier_cap_out <= 0:
-        return Decimal(0), Decimal(0), rest, False, tier_bucket, amm_dx, amm_dy, trace
-    ratio_out = (need / tier_cap_out) if tier_cap_out > 0 else Decimal(0)
-    ideal_out = []
-    ideal_in = []
-    for s in tier:
-        o = (min(s.out_max, need) * ratio_out)
-        ideal_out.append(o)
-        slice_ratio = (s.in_at_out_max / s.out_max) if s.out_max > 0 else Decimal(0)
-        ideal_in.append(o * slice_ratio)
-    # Respect send_max at tier level
-    sum_ideal_in = sum(ideal_in)
-    if send_max is not None and sum_ideal_in > send_max and sum_ideal_in > 0:
-        scale = (send_max / sum_ideal_in)
-        ideal_out = [x * scale for x in ideal_out]
-        ideal_in = [x * scale for x in ideal_in]
-    # Phase B: grid rounding + guard + largest-remainder top-up
-    flo_out: List[Decimal] = []
-    flo_in: List[Decimal] = []
-    rema: List[Decimal] = []
-    quanta: List[Decimal] = []
-    sum_out = Decimal(0)
-    sum_in = Decimal(0)
-    for s, o, i in zip(tier, ideal_out, ideal_in):
-        q_out = XRP_QUANTUM if s.out_is_xrp else IOU_QUANTUM
-        out_floor = round_out_max(o, is_xrp=s.out_is_xrp)
-        if out_floor > s.out_max:
-            out_floor = round_out_max(s.out_max, is_xrp=s.out_is_xrp)
-        if out_floor > 0:
-            ratio = s.in_at_out_max / s.out_max
-            in_ceil = round_in_min(out_floor * ratio, is_xrp=s.in_is_xrp)
-            in_ceil = _guard_inst_quality(out_floor, in_ceil, s.quality, in_is_xrp=s.in_is_xrp)
+        return ZERO, ZERO, rest, False, None, amm_dx, amm_dy, trace
+
+    # Phase A: proportional allocation on out-side units (integer grid)
+    # Use a common grid exponent that is the minimum exponent across target and tier out_max
+    out_exps = [s.out_max.exponent for s in tier] + [target_out.exponent]
+    grid_exp = min(out_exps)
+    cap_units = [_units_on_grid(s.out_max, grid_exp) for s in tier]
+    need_units = _units_on_grid(target_out, grid_exp)
+    total_units = sum(cap_units)
+    if total_units <= 0 or need_units <= 0:
+        return ZERO, ZERO, rest, False, tier_quality, amm_dx, amm_dy, trace
+
+    alloc_units = _alloc_proportional(cap_units, min(need_units, total_units))
+
+    # Convert allocated out-units back to STAmount and compute required IN via guard
+    flo_out: List[STAmount] = []
+    flo_in: List[STAmount] = []
+    sum_out = ZERO
+    sum_in = ZERO
+    for s, u in zip(tier, alloc_units):
+        if u <= 0:
+            flo_out.append(ZERO)
+            flo_in.append(ZERO)
+            continue
+        out_take = STAmount.from_components(u, grid_exp, 1)
+        # Proportional IN estimate: ceil(out_take * in_at_out_max / out_max) on integer grids
+        out_max_units = _units_on_grid(s.out_max, grid_exp)
+        in_grid_exp = s.in_at_out_max.exponent
+        in_max_units = _units_on_grid(s.in_at_out_max, in_grid_exp)
+        if out_max_units <= 0 or in_max_units <= 0:
+            in_amt = STAmount.zero()
         else:
-            in_ceil = Decimal(0)
-        flo_out.append(out_floor)
-        flo_in.append(in_ceil)
-        quanta.append(q_out)
-        rem = (o - out_floor) / q_out if q_out > 0 else Decimal(0)
-        rema.append(rem)
-        sum_out += out_floor
-        sum_in += in_ceil
-    # One-quantum top-up
-    remaining_out_gap = need - sum_out
-    if remaining_out_gap > 0:
-        order = sorted(range(len(tier)), key=lambda k: rema[k], reverse=True)
-        for k in order:
-            if remaining_out_gap <= 0:
-                break
-            s = tier[k]
-            q_out = quanta[k]
-            if q_out <= 0:
-                continue
-            cand_out = flo_out[k] + q_out
-            if cand_out > s.out_max or cand_out > need:
-                continue
-            ratio = s.in_at_out_max / s.out_max
-            cand_in = round_in_min(cand_out * ratio, is_xrp=s.in_is_xrp)
-            cand_in = _guard_inst_quality(cand_out, cand_in, s.quality, in_is_xrp=s.in_is_xrp)
-            inst_q = cand_out / cand_in if cand_in > 0 else Decimal(0)
-            if inst_q > s.quality:
-                continue
-            remaining_out_gap -= q_out
-            sum_out += q_out
-            sum_in += (cand_in - flo_in[k])
-            flo_out[k] = cand_out
-            flo_in[k] = cand_in
+            num = u * in_max_units
+            den = out_max_units
+            units_in_est = (num + den - 1) // den  # ceil division
+            in_amt = STAmount.from_components(units_in_est, in_grid_exp, 1)
+        flo_out.append(out_take)
+        flo_in.append(in_amt)
+        sum_out = sum_out + out_take
+        sum_in = sum_in + in_amt
+
+    # Respect send_max by scaling down once if needed
+    if send_max is not None and not send_max.is_zero() and sum_in > send_max:
+        # Scale down need_units and recompute once
+        # Use IN-side common grid
+        in_exps = [s.in_at_out_max.exponent for s in tier] + [send_max.exponent]
+        in_grid_exp = min(in_exps)
+        sum_in_units = _units_on_grid(sum_in, in_grid_exp)
+        send_max_units = _units_on_grid(send_max, in_grid_exp)
+        if sum_in_units > 0 and send_max_units < sum_in_units:
+            scaled_need_units = max(1, need_units * send_max_units // sum_in_units)
+            alloc_units = _alloc_proportional(cap_units, min(scaled_need_units, total_units))
+            # Recompute OUT/IN with scaled allocation
+            flo_out, flo_in, sum_out, sum_in = [], [], ZERO, ZERO
+            for s, u in zip(tier, alloc_units):
+                if u <= 0:
+                    flo_out.append(ZERO); flo_in.append(ZERO); continue
+                out_take = STAmount.from_components(u, grid_exp, 1)
+                # Proportional IN estimate: ceil(out_take * in_at_out_max / out_max) on integer grids
+                out_max_units = _units_on_grid(s.out_max, grid_exp)
+                in_grid_exp = s.in_at_out_max.exponent
+                in_max_units = _units_on_grid(s.in_at_out_max, in_grid_exp)
+                if out_max_units <= 0 or in_max_units <= 0:
+                    in_amt = STAmount.zero()
+                else:
+                    num = u * in_max_units
+                    den = out_max_units
+                    units_in_est = (num + den - 1) // den  # ceil division
+                    in_amt = STAmount.from_components(units_in_est, in_grid_exp, 1)
+                flo_out.append(out_take)
+                flo_in.append(in_amt)
+                sum_out = sum_out + out_take
+                sum_in = sum_in + in_amt
+
+    # One-quantum top-up using largest remainders (already handled by allocation; skip here)
+
     # Build next segments: carry non-AMM residuals; drop AMM residuals
     next_segs: List[Segment] = []
     amm_used = False
-    for s, out_i, in_i in zip(tier, flo_out, flo_in):
-        if s.src == "AMM" and (out_i > 0 or in_i > 0):
+    for s, o_i, i_i in zip(tier, flo_out, flo_in):
+        if s.src == "AMM" and (not o_i.is_zero() or not i_i.is_zero()):
             amm_used = True
-            amm_dx += in_i
-            amm_dy += out_i
-        rem_out = s.out_max - out_i
-        rem_in = s.in_at_out_max - in_i
-        if rem_out > 0 and rem_in > 0 and (s.quality > 0) and (s.src != "AMM") and (s is not synth):
+            amm_dx = amm_dx + i_i
+            amm_dy = amm_dy + o_i
+        rem_out = s.out_max - o_i
+        rem_in = s.in_at_out_max - i_i
+        if (not rem_out.is_zero()) and (not rem_in.is_zero()) and (s.quality.rate.sign > 0) and (s.src != "AMM") and (s is not synth):
             next_segs.append(Segment(
                 src=s.src,
                 out_max=rem_out,
@@ -204,74 +268,19 @@ def _execute_one_iteration(
                 in_is_xrp=s.in_is_xrp,
                 out_is_xrp=s.out_is_xrp,
             ))
-    # Append rest (non-tier) for the caller to consider in subsequent rounds
-    next_segs.extend([s for s in rest if (s.out_max > 0 and s.in_at_out_max > 0 and s.quality > 0 and s.src != "AMM")])
-    # Trace items (diagnostic only)
-    for s, o_raw, i_raw, o, i in zip(tier, ideal_out, ideal_in, flo_out, flo_in):
-        trace.append({
-            "src": s.src,
-            "take_out": o,
-            "take_in": i,
-            "quality": s.quality,
-            "take_out_raw": o_raw,
-            "take_in_raw": i_raw,
-        })
-    return sum_out, sum_in, next_segs, amm_used, tier_bucket, amm_dx, amm_dy, trace
+    # Append rest (non-tier)
+    next_segs.extend([
+        s for s in rest if (not s.out_max.is_zero()) and (not s.in_at_out_max.is_zero()) and (s.quality.rate.sign > 0) and s.src != "AMM"
+    ])
 
-from .path_builder import _prefer_clob_on_ties  # shared tie-break (whitepaper §1.2.7.2)
+    # Trace (integer domain)
+    for s, o, i in zip(tier, flo_out, flo_in):
+        trace.append({"src": s.src, "take_out": o, "take_in": i, "quality": s.quality})
+
+    return sum_out, sum_in, next_segs, amm_used, tier_quality, amm_dx, amm_dy, trace
+
 from .amm_context import AMMContext
 from .steps import Step
-
-
-
-
-# --- Whitepaper-aligned execution skeleton (to be filled in Batch 2) ---
-def _tier_segments(segs: List[Segment], lob_top_bucket: Optional[Decimal]) -> Tuple[List[Segment], List[Segment], Optional[Decimal]]:
-    """Partition segments into (tier, rest) where 'tier' is the single highest-quality bucket.
-    If lob_top_bucket is provided (AMM-anchored coexistence), use it as the tier key.
-    Returns: (tier, rest, chosen_bucket).
-    """
-    if not segs:
-        return [], [], None
-    # Determine the bucket
-    if lob_top_bucket is not None and lob_top_bucket > 0:
-        bucket = lob_top_bucket
-    else:
-        bucket = max((s.quality for s in segs), default=Decimal(0))
-    tier: List[Segment] = []
-    rest: List[Segment] = []
-    for s in segs:
-        if s.quality == bucket:
-            tier.append(s)
-        else:
-            rest.append(s)
-    return tier, rest, bucket if bucket > 0 else None
-
-def _for_each_offer(tier: List[Segment]) -> Iterable[Segment]:
-    """Iterate homogeneous quotes (same tier). Placeholder; will host offer objects later."""
-    # In Batch 2, this will yield CLOB `Offer` and synthetic `AMMOffer` instances.
-    return list(tier)
-
-def _exec_offer(seg: Segment, out_take: Decimal, *, preserve_quality: bool = True) -> Tuple[Decimal, Decimal, Dict[str, Any]]:
-    """Execute (simulate) consuming `out_take` from `seg`. Placeholder returning scaled take.
-    Returns (in_spent, out_filled, diagnostics).  In Batch 2, this will compute ownerGives/stpAmt
-    and enforce issuer fees per §1.3.2.4.  For now, keep proportional scaling (no writeback).
-    """
-    if out_take <= 0 or seg.out_max <= 0:
-        return Decimal(0), Decimal(0), {"src": seg.src, "note": "noop"}
-    # keep slice-quality via proportional scaling (multi-path semantics)
-    ratio = (seg.in_at_out_max / seg.out_max) if seg.out_max > 0 else Decimal(0)
-    in_need = out_take * ratio
-    return in_need, out_take, {"src": seg.src, "ratio": ratio}
-
-def _try_amm_anchor(lob_top_q: Decimal, need: Decimal, *, maker: Optional[Callable[[Decimal, Decimal], Optional[Segment]]]) -> Optional[Segment]:
-    """Call AMM anchoring callback if provided and SPQ strictly exceeds LOB top (enforced upstream)."""
-    if maker is None or lob_top_q <= 0 or need <= 0:
-        return None
-    try:
-        return maker(lob_top_q, need)
-    except Exception:
-        return None
 
 
 @dataclass
@@ -281,37 +290,33 @@ class BookStep(Step):
     Forward execution also stages AMM pool deltas (dx, dy) into the sandbox; Flow.apply()
     later commits them via apply_sink. The default_fee_hook stages CLOB out-side issuer fees into the sandbox; rev remains read-only.
     """
-
     segments_provider: Callable[[], Iterable[Segment]]
-    amm_anchor: Optional[Callable[[Decimal, Decimal], Optional[Segment]]] = None
-    amm_curve: Optional[Callable[[Decimal], Iterable[Segment]]] = None
-    amm_context: Optional[AMMContext] = None
+    amm_anchor: Optional[Callable[[Quality, STAmount], Optional[Segment]]] = None
+    amm_curve: Optional[Callable[[STAmount], Iterable[Segment]]] = None
+    amm_context: Optional["AMMContext"] = None
     # route_config: Optional[RouteConfig] = None
-    limit_quality: Optional[Decimal] = None
+    limit_quality: Optional[Quality] = None
     fee_hook: Optional[Callable[[List[Dict[str, Any]], "PaymentSandbox"], None]] = None
 
-    def rev(self, sandbox: "PaymentSandbox", out_req: Decimal) -> Tuple[Decimal, Decimal]:
-        # Reverse: compute required IN for a desired OUT without mutating ledger state.
-        if out_req is None or out_req <= 0:
-            self._cached_in = Decimal(0)
-            self._cached_out = Decimal(0)
+    def rev(self, sandbox: "PaymentSandbox", out_req: STAmount) -> Tuple[STAmount, STAmount]:
+        ZERO = STAmount.zero()
+        if out_req is None or out_req.is_zero():
+            self._cached_in = ZERO
+            self._cached_out = ZERO
             return self._cached_in, self._cached_out
         try:
             segs = _prefer_clob_on_ties(self.segments_provider())
         except Exception:
             segs = []
         if not segs:
-            self._cached_in = Decimal(0)
-            self._cached_out = Decimal(0)
+            self._cached_in = ZERO
+            self._cached_out = ZERO
             return self._cached_in, self._cached_out
-
-        # Internal multi-iteration execution (whitepaper semantics)
         need = out_req
-        total_in = Decimal(0)
-        total_out = Decimal(0)
-        # Safety cap on iterations to avoid infinite loops
+        total_in = ZERO
+        total_out = ZERO
         for _ in range(64):
-            if need <= 0 or not segs:
+            if need.is_zero() or not segs:
                 break
             filled, spent, next_segs, amm_used, _, amm_dx, amm_dy, _ = _execute_one_iteration(
                 segs,
@@ -322,46 +327,46 @@ class BookStep(Step):
                 amm_curve=self.amm_curve,
                 ctx=self.amm_context,
             )
-            if filled <= 0 or (filled == 0 and spent == 0):
+            if filled.is_zero():
                 break
-            total_in += spent
-            total_out += filled
+            total_in = total_in + spent
+            total_out = total_out + filled
             need = out_req - total_out
             segs = next_segs
             if amm_used and self.amm_context is not None:
                 self.amm_context.setAMMUsed()
-
         self._cached_out = total_out
         self._cached_in = total_in
         return self._cached_in, self._cached_out
 
-    def fwd(self, sandbox: "PaymentSandbox", in_cap: Decimal) -> Tuple[Decimal, Decimal]:
-        # Forward: compute achievable OUT given an input cap; ledger writebacks are still handled by higher layers.
-        if in_cap is None or in_cap <= 0:
-            self._cached_in = Decimal(0)
-            self._cached_out = Decimal(0)
+    def fwd(self, sandbox: "PaymentSandbox", in_cap: STAmount) -> Tuple[STAmount, STAmount]:
+        ZERO = STAmount.zero()
+        if in_cap is None or in_cap.is_zero():
+            self._cached_in = ZERO
+            self._cached_out = ZERO
             return self._cached_in, self._cached_out
         try:
             segs = _prefer_clob_on_ties(self.segments_provider())
         except Exception:
             segs = []
         if not segs:
-            self._cached_in = Decimal(0)
-            self._cached_out = Decimal(0)
+            self._cached_in = ZERO
+            self._cached_out = ZERO
             return self._cached_in, self._cached_out
-
-        # Internal multi-iteration execution with IN cap honoured via send_max
         remaining_in = in_cap
-        total_in = Decimal(0)
-        total_out = Decimal(0)
-        # Use a generous target_out upper bound (sum of available OUT); executor will scale by send_max
-        target_out = sum((s.out_max for s in segs), Decimal(0))
-        if target_out <= 0:
-            self._cached_in = Decimal(0)
-            self._cached_out = Decimal(0)
+        total_in = ZERO
+        total_out = ZERO
+        # Prefer the reverse cache to cap forward OUT so we don't overshoot requested amount
+        target_out = self._cached_out if hasattr(self, "_cached_out") and (not getattr(self, "_cached_out").is_zero()) else ZERO
+        if target_out.is_zero():
+            for s in segs:
+                target_out = target_out + s.out_max
+        if target_out.is_zero():
+            self._cached_in = ZERO
+            self._cached_out = ZERO
             return self._cached_in, self._cached_out
         for _ in range(64):
-            if remaining_in <= 0 or not segs or target_out <= 0:
+            if remaining_in.is_zero() or not segs or target_out.is_zero():
                 break
             filled, spent, next_segs, amm_used, _, amm_dx, amm_dy, trace = _execute_one_iteration(
                 segs,
@@ -372,40 +377,45 @@ class BookStep(Step):
                 amm_curve=self.amm_curve,
                 ctx=self.amm_context,
             )
-            if (filled <= 0 and spent <= 0) or spent <= 0:
+            if spent.is_zero():
                 break
-            total_in += spent
-            total_out += filled
+            total_in = total_in + spent
+            total_out = total_out + filled
             remaining_in = in_cap - total_in
             segs = next_segs
-            # Reduce future target_out by what we've already filled to avoid pointless work
-            target_out = sum((s.out_max for s in segs), Decimal(0))
+            # Decrease the remaining OUT target; do not exceed requested OUT from reverse stage
+            if not target_out.is_zero():
+                target_out = target_out - filled
+            else:
+                # Fallback: if no explicit cap, sum remaining capacities
+                target_out = ZERO
+                for s in segs:
+                    target_out = target_out + s.out_max
             if amm_used and self.amm_context is not None:
                 self.amm_context.setAMMUsed()
-            if amm_used and (amm_dx > 0 or amm_dy > 0) and sandbox is not None:
+            if amm_used and (not amm_dx.is_zero() or not amm_dy.is_zero()) and sandbox is not None:
                 try:
-                    sandbox.stage_after_iteration(amm_dx, -amm_dy)
+                    # Stage AMM deltas: dx added to pool, dy removed from pool (negative on out side)
+                    neg_dy = STAmount.from_components(amm_dy.mantissa, amm_dy.exponent, -1) if not amm_dy.is_zero() else STAmount.zero()
+                    sandbox.stage_after_iteration(amm_dx, neg_dy)
                 except Exception:
                     pass
-
-            # Execution‑time fee accounting (CLOB out‑side issuer fees)
-            hook = self.fee_hook or default_fee_hook
+            hook = self.fee_hook
             if sandbox is not None and hook is not None:
                 try:
                     hook(trace, sandbox)
                 except Exception:
                     pass
-
         self._cached_in = total_in
         self._cached_out = total_out
         return self._cached_in, self._cached_out
 
-    def quality_upper_bound(self) -> Decimal:
-        # Upper bound is the best available slice quality (prefer raw_quality).
+    def quality_upper_bound(self) -> Quality:
         try:
             segs = list(self.segments_provider())
         except Exception:
-            return Decimal(0)
+            return Quality.from_amounts(STAmount.zero(), STAmount.from_components(1, 0, 1))
         if not segs:
-            return Decimal(0)
-        return max((s.raw_quality or s.quality) for s in segs)
+            return Quality.from_amounts(STAmount.zero(), STAmount.from_components(1, 0, 1))
+        best = max((s.raw_quality if s.raw_quality else s.quality) for s in segs)
+        return best

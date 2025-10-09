@@ -1,50 +1,72 @@
-from __future__ import annotations
-"""Central API surface for repository-internal imports.
 
-Production vs research layering
--------------------------------
-- **Production (whitepaper-aligned)**: use `BookStep` for execution (per-iteration
-  Phase A/B inside the step), `AMM` for pool maths, and `AMMContext` for AMM usage
-  bookkeeping. These symbols are exported at module top-level.
-- **Research / legacy**: the old router (`route`) and execution-mode helpers live
-  under the research section below and are not part of the stable production API.
+"""Top-level API for xrpl_router (integer-domain).
 
-This separation keeps production code aligned with the whitepaper while still
-making it convenient to run experiments and scans from the same package.
+This module exposes the stable, production-facing interface aligned with the XRPL whitepaper:
+  - BookStep: unified market step (CLOB/AMM)
+  - AMM: automated market maker logic
+  - AMMContext: AMM usage bookkeeping (iteration caps, multi-path guards)
+
+Core data types and execution primitives are fully integer-domain and follow XRPL STAmount semantics.
+
+Research-oriented helpers (legacy router, efficiency scans, execution modes)
+remain under the `xrpl_router.research` subpackage and are **not** part of the
+stable API surface.
 """
 
-# -----------------
-# Production (stable intra-repo surface)
-# -----------------
-from .core import Segment, RouteResult, ExecutionReport
+# NOTE:
+#   This package exposes only production-ready, integer-domain interfaces aligned with XRPL semantics.
+#   Decimal-based utilities and experimental routing logic remain under `xrpl_router.research`.
+#   Import those explicitly when running analysis or performance experiments.
+
+from __future__ import annotations
+
+"""Top-level API for xrpl_router (integer-domain).
+
+This module exposes the stable, production-facing interface aligned with the XRPL whitepaper:
+  - BookStep: unified market step (CLOB/AMM)
+  - AMM: automated market maker logic
+  - AMMContext: AMM usage bookkeeping (iteration caps, multi-path guards)
+
+Core data types and execution primitives are fully integer-domain and follow XRPL STAmount semantics.
+
+Research-oriented helpers (legacy router, efficiency scans, execution modes)
+remain under the `xrpl_router.research` subpackage and are **not** part of the
+stable API surface.
+"""
+
+# Stable intra-repo surface (production)
 from .book_step import BookStep
 from .amm_context import AMMContext
 from .amm import AMM
 
+# Core data types: keep exported if other modules rely on them.
+from .core import (
+    Segment,
+    RouteResult,
+    ExecutionReport,
+    STAmount,
+    Quality,
+    round_in_min,
+    round_out_max,
+)
+
 __all__ = [
-    # core data types
-    "Segment",
-    "RouteResult",
-    "ExecutionReport",
     # execution building blocks
     "BookStep",
     "AMMContext",
     "AMM",
+    # core data types (kept for compatibility)
+    "Segment",
+    "RouteResult",
+    "ExecutionReport",
+    # core integer-domain types
+    "STAmount",
+    "Quality",
+    "round_in_min",
+    "round_out_max",
 ]
 
-# -----------------
-# Research / legacy (non-stable)
-# -----------------
-# Heavyweight helpers for notebooks and internal studies; API may change.
-from .path_builder import route  # legacy router (research-only)
-from .exec_modes import ExecutionMode, run_trade_mode
-from .efficiency_scan import (
-    hybrid_flow,
-    analyze_alpha_scan,
-    find_crossover_q,
-    summarize_hybrid,
-    summarize_alpha_scan,
-    summarize_crossover,
-    batch_analyze,
-    batch_rows_to_csv,
-)
+# NOTE:
+# Research / legacy utilities (route, efficiency scans, execution modes)
+# are intentionally *not* imported at the top-level.
+# Use: `from xrpl_router import research` and import from there.

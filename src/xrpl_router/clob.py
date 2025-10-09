@@ -7,22 +7,32 @@ execution (ownerGives), per whitepaper §1.3.2.4.
 Helpers (public):
 - make_ladder(depth, top_quality, qty_per_level, decay, ...): canonical geometric ladder
 - from_levels([(quality, out_max), ...], ...): explicit levels to segments
-- normalise_segments(segments): snap amounts & bucket quality, sort by quality desc
+- normalise_segments(segments): integer-domain filter & sort by quality desc
+
+All functions return taker-view segments; issuer OUT-side fees are deferred to execution-time (BookStep).
 """
+
+# NOTE:
+#   This module performs Decimal-based rounding only at the I/O boundary (price and liquidity inputs).
+#   All subsequent computations, sorting, and quality comparisons are performed in the integer domain
+#   via STAmount and Quality. This matches XRPL's ledger semantics where all amounts are integer-scaled.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Iterable, List, Tuple, Optional
+from typing import Iterable, List
 
-from .core import (
-    Segment,
-    to_decimal,
-    calc_quality,
-    round_in_min,
-    round_out_max,
-    quality_bucket,
-)
+from .core.datatypes import Segment
+from .core.amounts import STAmount, round_in_min, round_out_max
+from .core.quality import Quality
+
+# Local Decimal helpers (I/O boundary only)
+DecimalLike = Decimal | int | str
+
+def to_decimal(x: DecimalLike) -> Decimal:
+    # Convert a numeric-like value to Decimal for I/O boundary calculations
+    return x if isinstance(x, Decimal) else Decimal(str(x))
 
 
 @dataclass(frozen=True)
@@ -32,8 +42,8 @@ class ClobLevel:
     out_liquidity: Decimal
 
     @staticmethod
-    def from_numbers(price_in_per_out: float | str | Decimal,
-                     out_liquidity: float | str | Decimal) -> "ClobLevel":
+    def from_numbers(price_in_per_out: DecimalLike,
+                     out_liquidity: DecimalLike) -> "ClobLevel":
         """Build a level from plain numbers/strings."""
         return ClobLevel(
             price_in_per_out=to_decimal(price_in_per_out),
@@ -50,8 +60,8 @@ class Clob:
         *,
         in_is_xrp: bool,
         out_is_xrp: bool,
-        tr_in: Decimal | str | float = Decimal("0"),
-        tr_out: Decimal | str | float = Decimal("0"),
+        tr_in: DecimalLike = Decimal("0"),
+        tr_out: DecimalLike = Decimal("0"),
     ):
         self.levels = levels
         self.in_is_xrp = in_is_xrp
@@ -74,30 +84,32 @@ class Clob:
             out_gross = round_out_max(lvl.out_liquidity, is_xrp=self.out_is_xrp)
             if out_gross <= 0:
                 continue
-            in_req_at_price = lvl.price_in_per_out * out_gross
+            gross_in_needed = lvl.price_in_per_out * out_gross
             if self.tr_in > 0:
-                in_req_at_price = in_req_at_price / (Decimal(1) - self.tr_in)
-            in_gross = round_in_min(in_req_at_price, is_xrp=self.in_is_xrp)
+                gross_in_needed = gross_in_needed / (Decimal(1) - self.tr_in)
+            in_gross = round_in_min(gross_in_needed, is_xrp=self.in_is_xrp)
             if in_gross <= 0:
                 continue
-            # Use quality bucket for tier grouping.
-            raw_q = calc_quality(out_gross, in_gross)
-            q = quality_bucket(raw_q)
-            if q <= 0:
+            # Convert to integer-domain amounts.
+            out_st = STAmount.from_decimal(out_gross)
+            in_st = STAmount.from_decimal(in_gross)
+            # Compute integer-domain quality and validate positivity.
+            q = Quality.from_amounts(offer_out=out_st, offer_in=in_st)
+            if q.rate.sign <= 0:
                 continue
             segs.append(Segment(
                 src="CLOB",
                 quality=q,
-                out_max=out_gross,
-                in_at_out_max=in_gross,
+                out_max=out_st,
+                in_at_out_max=in_st,
                 in_is_xrp=self.in_is_xrp,
                 out_is_xrp=self.out_is_xrp,
-                raw_quality=raw_q,
+                raw_quality=q,
                 source_id=None,
             ))
 
-        # Sort by bucketed quality (highest first). Router expects tiers by quality buckets.
-        segs.sort(key=lambda s: s.quality, reverse=True)
+        # Sort by integer-domain quality (highest first).
+        segs.sort(key=lambda s: (s.quality.rate.exponent, s.quality.rate.mantissa), reverse=True)
         return segs
 
 
@@ -113,8 +125,8 @@ def make_ladder(
     decay: Decimal,
     in_is_xrp: bool = False,
     out_is_xrp: bool = False,
-    tr_in: Decimal | str | float = Decimal("0"),
-    tr_out: Decimal | str | float = Decimal("0"),
+    tr_in: DecimalLike = Decimal("0"),
+    tr_out: DecimalLike = Decimal("0"),
 ) -> List[Segment]:
     """Create a geometric-quality ladder and emit CLOB segments.
 
@@ -127,7 +139,9 @@ def make_ladder(
         tr_in/tr_out: issuer transfer fees (bps in decimal; ignored if the side is XRP)
 
     Returns:
-        List[Segment] sorted by quality desc, quality bucketed & amounts rounded.
+        List[Segment] sorted by quality desc; amounts are rounded to grids.
+
+    All emitted segments are taker-view; OUT-side issuer fees are applied later during execution.
     """
     if depth <= 0:
         return []
@@ -151,17 +165,19 @@ def make_ladder(
 
 
 def from_levels(
-    levels: Iterable[Tuple[Decimal, Decimal]],
+    levels: Iterable[tuple[Decimal, Decimal]],
     *,
     in_is_xrp: bool = False,
     out_is_xrp: bool = False,
-    tr_in: Decimal | str | float = Decimal("0"),
-    tr_out: Decimal | str | float = Decimal("0"),
+    tr_in: DecimalLike = Decimal("0"),
+    tr_out: DecimalLike = Decimal("0"),
 ) -> List[Segment]:
     """Create CLOB segments from explicit (quality, out_max) pairs.
 
     Quality is OUT/IN (>0). We convert to price (IN/OUT) internally. Amounts and quality
     are snapped to grids/buckets via `segments()`.
+
+    All emitted segments are taker-view; OUT-side issuer fees are applied later during execution.
     """
     lvls: List[ClobLevel] = []
     for qual, out_max in levels:
@@ -178,38 +194,32 @@ def from_levels(
 
 
 def normalise_segments(segs: Iterable[Segment]) -> List[Segment]:
-    """Normalise pre-built CLOB segments to canonical form.
+    """Normalize pre-built CLOB segments (integer domain).
 
+    This function operates purely in the integer domain:
     - Drop non-positive amounts/qualities
-    - Recompute bucketed quality and rounded amounts on declared grids
-    - Sort by quality desc
+    - Preserve amounts as given (assumed already snapped to appropriate grids)
+    - Sort by quality (higher is better)
     """
     out: List[Segment] = []
     for s in segs:
-        if s.out_max <= 0:
+        if s.out_max.is_zero():
             continue
-        if s.in_at_out_max <= 0:
+        if s.in_at_out_max.is_zero():
             continue
-        if s.quality <= 0:
+        q = s.quality if s.quality.rate.sign > 0 else s.implied_quality()
+        if q.rate.sign <= 0:
             continue
-        # Re-snap amounts to grids
-        out_max = round_out_max(s.out_max, is_xrp=s.out_is_xrp)
-        in_need = round_in_min(s.in_at_out_max, is_xrp=s.in_is_xrp)
-        if out_max <= 0 or in_need <= 0:
-            continue
-        q = quality_bucket(calc_quality(out_max, in_need))
-        if q <= 0:
-            continue
-        raw_q = calc_quality(out_max, in_need)
         out.append(Segment(
-            src="CLOB",
+            src=s.src,
             quality=q,
-            out_max=out_max,
-            in_at_out_max=in_need,
+            out_max=s.out_max,
+            in_at_out_max=s.in_at_out_max,
             in_is_xrp=s.in_is_xrp,
             out_is_xrp=s.out_is_xrp,
-            raw_quality=raw_q,
+            raw_quality=s.raw_quality or q,
             source_id=getattr(s, "source_id", None),
         ))
-    out.sort(key=lambda z: z.quality, reverse=True)
+    # Sort by numeric rate: (exponent, mantissa) descending
+    out.sort(key=lambda z: (z.quality.rate.exponent, z.quality.rate.mantissa), reverse=True)
     return out

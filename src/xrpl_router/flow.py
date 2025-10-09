@@ -1,52 +1,67 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Iterable, List, Optional, Tuple, Callable
 
 from .amm_context import AMMContext
-from .steps import Step
-from .core import compose_path_quality
+from .core import STAmount, Quality
 
-# --- Numerical guards for budget-constrained replay ---
-BUDGET_EPS = Decimal("1e-9")        # absolute tolerance on budget (Decimal)
-MAX_FLOW_ITERS = 128                # hard cap on reverse→forward replay rounds
-# Local step-level epsilon (kept at 0 to preserve behaviour)
-STEP_EPS = Decimal("0")
+# ----------------------------
+# Integer-domain helpers
+# ----------------------------
 
-def _budget_eps(budget0: Optional[Decimal]) -> Decimal:
-    """Compute a tolerant epsilon based on initial budget magnitude.
+ZERO = STAmount.zero()
 
-    We allow a tiny overshoot due to rounding/bucketing: eps = max(abs_epsilon, rel*|budget0|).
+
+def _gt_zero(x: STAmount) -> bool:
+    return (not x.is_zero()) and (x > ZERO)
+
+
+def _compose_path_quality(step_quals: List[Quality]) -> Optional[Quality]:
+    """Multiply per-step qualities to get a composed path quality.
+
+    Quality is an STAmount-based rate. We multiply mantissas and add exponents
+    in the integer domain, then normalise via STAmount.from_components.
     """
-    if budget0 is None:
-        return BUDGET_EPS
-    rel = (budget0.copy_abs() * BUDGET_EPS)
-    return rel if rel > BUDGET_EPS else BUDGET_EPS
+    if not step_quals:
+        return None
+    m = 1
+    e = 0
+    for q in step_quals:
+        # If any step has zero/invalid rate, path quality is unusable
+        if q.rate.is_zero():
+            return None
+        m *= q.rate.mantissa
+        e += q.rate.exponent
+    rate = STAmount.from_components(m, e, 1)
+    if rate.is_zero():
+        return None
+    return Quality(rate)
 
+
+# ----------------------------
+# Payment sandbox
+# ----------------------------
 
 @dataclass
 class PaymentSandbox:
-    """Lightweight sandbox to stage AMM/CLOB writebacks between passes.
+    """Stage AMM/CLOB writebacks between reverse and forward passes.
 
-    Reverse pass computes needs, forward pass replays with limits;
-    interim changes are staged and applied upon `apply()`. The actual
-    pool/book mutation is delegated to `apply_sink`.
+    Values are tracked as STAmount pairs (dx, dy). The actual sink is injected
+    by the caller (e.g., to mutate pools/books) and is only called on success.
     """
-    staged: List[Tuple[Decimal, Decimal]]
+    staged: List[Tuple[STAmount, STAmount]]
 
     def __init__(self) -> None:
         self.staged = []
 
-    def stage_after_iteration(self, dx: Decimal, dy: Decimal) -> None:
-        # Router calls this after each iteration; we record and defer actual pool updates
+    def stage_after_iteration(self, dx: STAmount, dy: STAmount) -> None:
         self.staged.append((dx, dy))
 
-    def stage_fee(self, dx: Decimal, dy: Decimal) -> None:
-        """Stage a pure fee adjustment (e.g. issuer fee). Same format as stage_after_iteration."""
+    def stage_fee(self, dx: STAmount, dy: STAmount) -> None:
         self.staged.append((dx, dy))
 
-    def apply(self, sink: Optional[Callable[[Decimal, Decimal], None]]) -> None:
+    def apply(self, sink: Optional[Callable[[STAmount, STAmount], None]]) -> None:
         if sink is None:
             self.staged.clear()
             return
@@ -55,86 +70,96 @@ class PaymentSandbox:
         self.staged.clear()
 
 
-def flow(payment_sandbox: PaymentSandbox,
-         strands: Iterable[List[Step]],
-         out_req: Decimal,
-         *,
-         send_max: Optional[Decimal] = None,
-         limit_quality: Optional[Decimal] = None,   # reserved for per-strand use
-         amm_context: Optional[AMMContext] = None,  # shared context if needed
-         apply_sink: Optional[Callable[[Decimal, Decimal], None]] = None
-         ) -> Tuple[Decimal, Decimal]:
-    """Execute strands per whitepaper (§1.3.2) — minimal skeleton.
+# ----------------------------
+# Main scheduler (reverse → forward)
+# ----------------------------
 
-    Conservative multi-path scheduler:
-      * Compose path quality as the product of step bounds; sort candidates by quality (desc).
-      * Each round, set AMM multi-path flag based on active candidate count.
-      * For each round, try candidates in order; reverse pass then forward replay.
-      * On failure, clear staged writes and try the next candidate; on success, apply staged writes.
+def flow(
+    payment_sandbox: PaymentSandbox,
+    strands: Iterable[List["Step"]],  # runtime duck-typed; must expose quality_upper_bound/rev/fwd
+    out_req: STAmount,
+    *,
+    send_max: Optional[STAmount] = None,
+    limit_quality: Optional[Quality] = None,   # optional composed-path floor
+    amm_context: Optional[AMMContext] = None,
+    apply_sink: Optional[Callable[[STAmount, STAmount], None]] = None,
+) -> Tuple[STAmount, STAmount]:
+    """Execute strands per whitepaper (§1.3.2) in the integer domain.
+
+    Returns a pair (total_in, total_out) as STAmount. The caller is responsible
+    for any Decimal/display conversion at I/O boundaries.
     """
-    # Materialise strands to allow repeatable iteration across rounds
+    if out_req.is_zero() or not _gt_zero(out_req):
+        return (ZERO, ZERO)
+
+    # Materialise strands for deterministic iteration across rounds
     strands = list(strands)
 
-    remaining_out = out_req
-    remaining_in = send_max
+    remaining_out: STAmount = out_req
+    remaining_in: Optional[STAmount] = send_max
 
-    budget0 = send_max  # remember initial budget to derive a stable epsilon
-    eps = _budget_eps(budget0)
+    actual_in = ZERO
+    actual_out = ZERO
+
     iters = 0
 
-    actual_in = Decimal(0)
-    actual_out = Decimal(0)
-
-    # Sort by quality bound (desc) each iteration
-    while remaining_out > 0 and (remaining_in is None or remaining_in > -eps):
-        active: List[Tuple[Decimal, List[Step]]] = []
+    while _gt_zero(remaining_out) and (remaining_in is None or remaining_in >= ZERO):
+        # Collect active candidates with composed path quality
+        active: List[Tuple[Quality, List["Step"]]] = []
         for strand in strands:
             try:
-                step_qs = [s.quality_upper_bound() for s in strand]
-                q = compose_path_quality(step_qs)
+                step_qs = [s.quality_upper_bound() for s in strand]  # must return Quality
+                q = _compose_path_quality(step_qs)
             except Exception:
-                q = Decimal(0)
-            if q <= 0:
+                q = None
+            if q is None:
                 continue
-            if limit_quality is not None and q < limit_quality:
+            if limit_quality is not None and q.rate < limit_quality.rate:
                 continue
             active.append((q, strand))
+
         if not active:
             break
-        # Sort paths by composed quality (desc) and set multi-path flag for this round
-        active.sort(key=lambda t: t[0], reverse=True)
-        if amm_context is not None:
-            amm_context.setMultiPath(len(active) > 1)
 
-        # Try candidates in order until one succeeds; if none succeed, terminate
+        # Sort by numeric value of rate: mantissa * 10^exponent. Compare by (exponent, mantissa) desc.
+        # Python's sort is stable, so equal keys preserve insertion order as a tie-break.
+        active.sort(key=lambda t: (t[0].rate.exponent, t[0].rate.mantissa), reverse=True)
+
+        # Set multipath flag (best-effort)
+        if amm_context is not None:
+            try:
+                amm_context.setMultiPath(len(active) > 1)
+            except Exception:
+                pass
+
+        # Try candidates sequentially until one succeeds
         attempt_succeeded = False
         for _, best in active:
-            # Reverse pass (no writebacks during rev): record step requirements and limiting step
+            # Reverse pass: compute required IN and locate limiting step
             need = remaining_out
             sb = payment_sandbox
-            rev_records: List[Tuple[int, Step, Decimal, Decimal]] = []
             limiting_idx: Optional[int] = None
             n_steps = len(best)
+
             for rev_pos, step in enumerate(reversed(best)):
                 idx_forward = n_steps - 1 - rev_pos
-                _in, _out = step.rev(sb, need)
-                rev_records.append((idx_forward, step, need, _out))
-                if _out <= STEP_EPS:
-                    need = Decimal(0)
+                _in, _out = step.rev(sb, need)  # returns STAmount pairs
+                if not _gt_zero(_out):
+                    need = ZERO
                     limiting_idx = idx_forward
                     break
                 if _out < need:
                     limiting_idx = idx_forward
                 need = _in
-            if need <= 0:
-                # This strand cannot progress; clear any staged writes defensively and try next
+
+            if not _gt_zero(need):
                 payment_sandbox.apply(None)
                 continue
+
             required_in = need
 
-            # Determine start index for forward replay:
-            budget_limited = (remaining_in is not None and (remaining_in + eps) < required_in)
-            if budget_limited:
+            # Determine start index for forward replay
+            if remaining_in is not None and remaining_in < required_in:
                 start_idx = 0
                 in_cap0 = remaining_in  # budget is the cap
             else:
@@ -142,17 +167,17 @@ def flow(payment_sandbox: PaymentSandbox,
                 in_cap0 = required_in
 
             # Forward replay from start_idx to end
-            in_spent_add = Decimal(0)
-            out_propagate = Decimal(0)
+            in_spent_add = ZERO
+            out_propagate = ZERO
             ok = True
             for i in range(start_idx, len(best)):
                 step_i = best[i]
                 cap = in_cap0 if i == start_idx else out_propagate
-                if cap is None or cap <= STEP_EPS:
+                if not _gt_zero(cap):
                     ok = False
                     break
                 _in2, _out2 = step_i.fwd(sb, cap)
-                if _in2 <= STEP_EPS or _out2 <= STEP_EPS:
+                if not _gt_zero(_in2) or not _gt_zero(_out2):
                     ok = False
                     break
                 if i == start_idx:
@@ -160,29 +185,25 @@ def flow(payment_sandbox: PaymentSandbox,
                 out_propagate = _out2
 
             if not ok:
-                # Clear any staged writes for this failed attempt and try next candidate
                 payment_sandbox.apply(None)
                 continue
 
             # Commit accounting for the successful candidate
-            actual_in += in_spent_add
-            actual_out += out_propagate
+            actual_in = actual_in + in_spent_add
+            actual_out = actual_out + out_propagate
             remaining_out = out_req - actual_out
             if remaining_in is not None:
-                remaining_in -= in_spent_add
-            if remaining_in is not None and remaining_in < 0 and (-remaining_in) <= eps:
-                remaining_in = Decimal(0)
+                remaining_in = remaining_in - in_spent_add
 
-            # Apply staged AMM/CLOB updates for this iteration
             payment_sandbox.apply(apply_sink)
             attempt_succeeded = True
-            break  # move to next outer iteration
+            break
 
         if not attempt_succeeded:
             break
 
         iters += 1
-        if iters >= MAX_FLOW_ITERS:
+        if iters >= 128:  # MAX_FLOW_ITERS (kept local)
             break
 
     return actual_in, actual_out

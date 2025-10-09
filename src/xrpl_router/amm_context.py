@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
 
 # Per whitepaper §1.2.7.3: cap the number of iterations in which AMM liquidity
 # is actually consumed to avoid runaway growth of synthetic AMM offers and to
@@ -28,7 +27,7 @@ class AMMContext:
         aggregated AMM in/out was strictly positive (i.e., the iteration filled
         some amount from the AMM). Only those iterations advance the counter.
       * This context only tracks the multipath flag and AMM-using iteration count,
-        per whitepaper §1.2.7.3.
+        per whitepaper §1.2.7.3. The iteration cap is MAX_AMM_ITERS (=30).
     """
 
     # Whether the current execution is multi-path (pre-wired; not strictly used
@@ -74,13 +73,5 @@ class AMMContext:
         per the whitepaper’s iteration cap.
         """
         return self._amm_used_iters >= MAX_AMM_ITERS
-
-    def reset_all(self) -> None:
-        """Reset iteration counter.
-
-        Intended for test setup or to start a fresh trade session without
-        carrying over state.
-        """
-        self._amm_used_iters = 0
 
 __all__ = ["AMMContext", "MAX_AMM_ITERS"]
