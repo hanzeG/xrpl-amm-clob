@@ -1,194 +1,119 @@
-# tests/integration/test_flow_with_amm.py
+import pytest
 from decimal import Decimal
-from typing import Tuple
 
-from xrpl_router.flow import flow, PaymentSandbox
-from xrpl_router.core import STAmount, Quality, ST_MANTISSA_MIN
-from xrpl_router.steps import Step
 from xrpl_router.amm import AMM
+from xrpl_router.core import Quality, XRPAmount, IOUAmount
+
+# Debug helpers for readable output during pytest -s
+from fractions import Fraction
+
+from xrpl_router.core.fmt import fmt_dec, amount_to_decimal, quality_rate_to_decimal, quality_price_to_decimal
+LOG_PLACES = 6
+
+def _qd(q) -> str:
+    return fmt_dec(quality_rate_to_decimal(q), places=LOG_PLACES)
+
+def _pd(q) -> str:
+    return fmt_dec(quality_price_to_decimal(q), places=LOG_PLACES)
+
+def frac_str(fr: Fraction) -> str:
+    return f"{fr.numerator}/{fr.denominator} (~{fr.numerator/fr.denominator:.12g})"
+
+# Pretty checks for human-friendly test output
 
 
-class MinimalAMMStep(Step):
-    """
-    Minimal AMM-backed Step to validate integer-domain flow():
-    - Orientation: AMM inputs are X, outputs are Y (same as AMM class).
-    - rev(): compute min IN for requested OUT using AMM.swap_in_given_out, stage to sandbox.
-    - fwd(): compute OUT for IN capacity using AMM.swap_out_given_in, stage to sandbox.
-    - quality_upper_bound(): construct Quality from AMM SPQ.
-    Note: AMM keeps Decimal maths internally (by design for now); Step bridges at the boundary.
-    """
-
-    def __init__(self, amm: AMM, name: str = "amm-step"):
-        self.amm = amm
-        self.name = name
-        self._cached_in = STAmount.zero()
-        self._cached_out = STAmount.zero()
-
-    def _st_iou_units(self, units: int) -> STAmount:
-        # Helper: units in IOU grid (mantissa=k*1e15, exponent=-15)
-        return STAmount.from_components(ST_MANTISSA_MIN * units, -15, 1)
-
-    def quality_upper_bound(self) -> Quality:
-        q_dec = self.amm.spq()  # Decimal
-        if q_dec <= 0:
-            # Return zero quality
-            return Quality.from_amounts(STAmount.zero(), self._st_iou_units(1))
-        out_1 = STAmount.from_decimal(q_dec)  # OUT per 1 IN
-        in_1 = self._st_iou_units(1)
-        return Quality.from_amounts(out_1, in_1)
-
-    def rev(self, sandbox: PaymentSandbox, out_req: STAmount) -> Tuple[STAmount, STAmount]:
-        # Requested OUT is on Y side
-        if out_req.is_zero():
-            self._cached_in = STAmount.zero()
-            self._cached_out = STAmount.zero()
-            return self._cached_in, self._cached_out
-
-        # Convert to Decimal for AMM
-        dy_req_dec = out_req.to_decimal()
-        try:
-            dx_need_dec = self.amm.swap_in_given_out(dy_req_dec)
-        except Exception:
-            dx_need_dec = Decimal(0)
-
-        if dx_need_dec <= 0:
-            self._cached_in = STAmount.zero()
-            self._cached_out = STAmount.zero()
-            return self._cached_in, self._cached_out
-
-        # Recompute achievable OUT for safety (fees/grids)
-        dy_got_dec = self.amm.swap_out_given_in(dx_need_dec)
-        if dy_got_dec <= 0:
-            self._cached_in = STAmount.zero()
-            self._cached_out = STAmount.zero()
-            return self._cached_in, self._cached_out
-
-        # Cap to out_req
-        if dy_got_dec > dy_req_dec:
-            dy_got_dec = dy_req_dec
-
-        dx_need = STAmount.from_decimal(dx_need_dec)
-        dy_got = STAmount.from_decimal(dy_got_dec)
-
-        # Stage to sandbox (router convention: stage_after_iteration records (dx, dy))
-        sandbox.stage_after_iteration(dx_need, dy_got)
-
-        self._cached_in = dx_need
-        self._cached_out = dy_got
-        return self._cached_in, self._cached_out
-
-    def fwd(self, sandbox: PaymentSandbox, in_cap: STAmount) -> Tuple[STAmount, STAmount]:
-        # Forward must consume the reverse cache when possible to stay consistent with flow()
-        ZERO = STAmount.zero()
-        if in_cap.is_zero():
-            self._cached_in = ZERO
-            self._cached_out = ZERO
-            return self._cached_in, self._cached_out
-
-        # If reverse computed a feasible pair (cached_in, cached_out), prefer consuming it.
-        if (not self._cached_in.is_zero()) and (not self._cached_out.is_zero()):
-            # Case A: caller allows at least the cached IN → execute cached pair
-            if (in_cap.mantissa == self._cached_in.mantissa and in_cap.exponent == self._cached_in.exponent and in_cap.sign == self._cached_in.sign) or (
-                (in_cap.exponent == self._cached_in.exponent and in_cap.mantissa > self._cached_in.mantissa) or
-                (in_cap.exponent > self._cached_in.exponent)
-            ):
-                in_spent = self._cached_in
-                out_got = self._cached_out
-                sandbox.stage_after_iteration(in_spent, out_got)
-                return in_spent, out_got
-            # Case B: smaller cap → scale proportionally (best-effort) to avoid zeroing out
-            try:
-                cap_dec = in_cap.to_decimal()
-                cin_dec = self._cached_in.to_decimal()
-                cout_dec = self._cached_out.to_decimal()
-                if cin_dec > 0:
-                    dy_dec = (cap_dec * cout_dec) / cin_dec
-                else:
-                    dy_dec = Decimal(0)
-            except Exception:
-                dy_dec = Decimal(0)
-            if dy_dec <= 0:
-                self._cached_in = ZERO
-                self._cached_out = ZERO
-                return self._cached_in, self._cached_out
-            in_spent = in_cap
-            out_got = STAmount.from_decimal(dy_dec)
-            sandbox.stage_after_iteration(in_spent, out_got)
-            self._cached_in = in_spent
-            self._cached_out = out_got
-            return in_spent, out_got
-
-        # Fallback: no reverse cache available → compute directly via AMM
-        dx_cap_dec = in_cap.to_decimal()
-        dy_dec = self.amm.swap_out_given_in(dx_cap_dec)
-        if dy_dec <= 0:
-            self._cached_in = ZERO
-            self._cached_out = ZERO
-            return self._cached_in, self._cached_out
-        dy = STAmount.from_decimal(dy_dec)
-        sandbox.stage_after_iteration(in_cap, dy)
-        self._cached_in = in_cap
-        self._cached_out = dy
-        return self._cached_in, self._cached_out
-
-
-# ---------------------------
-# Helpers to build STAmount
-# ---------------------------
-def iou_units(n: int) -> STAmount:
-    return STAmount.from_components(ST_MANTISSA_MIN * n, -15, 1)
-
-
-# ===========================
-# Tests
-# ===========================
-
-def test_flow_with_amm_iou_iou():
-    """
-    IOU→IOU AMM:
-    - Pool: x=1,000,000 IOU, y=500,000 IOU, fee=0.3%
-    - Request: out_req = 1,000 IOU on Y
-    Expect: positive IN/OUT, and OUT ≤ requested.
-    """
-    amm = AMM(
-        x_reserve=Decimal("1000000"),
-        y_reserve=Decimal("500000"),
-        fee=Decimal("0.003"),
-        x_is_xrp=False,
-        y_is_xrp=False,
+def _amm_default():
+    # Symmetric IOU/IOU pool, no issuer transfer fees
+    # x=1000, y=2000, fee=0.003 (input-side)
+    return AMM(
+        Decimal("1000"), Decimal("2000"), Decimal("0.003"),
+        x_is_xrp=False, y_is_xrp=False,
+        tr_in=Decimal("0"), tr_out=Decimal("0"),
     )
-    step = MinimalAMMStep(amm)
-    sb = PaymentSandbox()
-
-    out_req = iou_units(1000)
-    total_in, total_out = flow(sb, [[step]], out_req)
-
-    assert not total_in.is_zero()
-    assert not total_out.is_zero()
-    # OUT cannot exceed requested in our step design
-    assert (total_out.to_decimal() - out_req.to_decimal()) <= Decimal("1e-15")
 
 
-def test_flow_with_amm_xrp_iou():
-    """
-    XRP→IOU AMM:
-    - Pool: x=2,000,000 XRP, y=1,000,000 IOU, fee=0.2%
-    - Request: out_req = 2,000 IOU on Y
-    Expect: positive IN/OUT, OUT ≤ requested.
-    """
-    amm = AMM(
-        x_reserve=Decimal("2000000"),
-        y_reserve=Decimal("1000000"),
-        fee=Decimal("0.002"),
-        x_is_xrp=True,   # X is XRP
-        y_is_xrp=False,  # Y is IOU
-    )
-    step = MinimalAMMStep(amm)
-    sb = PaymentSandbox()
+def _units(amm: AMM):
+    return amm._reserve_units()
 
-    out_req = iou_units(2000)
-    total_in, total_out = flow(sb, [[step]], out_req)
 
-    assert not total_in.is_zero()
-    assert not total_out.is_zero()
-    assert (total_out.to_decimal() - out_req.to_decimal()) <= Decimal("1e-15")
+def test_spq_non_increasing_after_apply_fill_st():
+    amm = _amm_default()
+    prev_spq = amm.spq_quality_int().as_fraction()
+    print("\n===== AMM_APPLY_FILL =====")
+
+    # Ask for a modest OUT and compute the corresponding IN with the AMM itself
+    target_out = IOUAmount.from_components(40, -0)  # 40 units on IOU grid (10^-15 scaled inside)
+    dx_needed = amm.swap_in_given_out_st(target_out)
+    print(f"    swap_in_given_out_st: dx_needed={fmt_dec(amount_to_decimal(dx_needed), places=LOG_PLACES)}")
+    assert not dx_needed.is_zero(), "swap_in_given_out_st returned zero IN"
+
+    # Apply the fill and verify SPQ did not improve
+    amm.apply_fill_st(dx_needed, target_out)
+    next_spq = amm.spq_quality_int().as_fraction()
+    print(f"    prev SPQ={float(prev_spq):.6f}, next SPQ={float(next_spq):.6f}, Δ={float(prev_spq - next_spq):.6f}, monotone={next_spq <= prev_spq}")
+
+    assert next_spq <= prev_spq, (
+        f"SPQ improved after fill: prev={prev_spq}, next={next_spq}")
+
+
+def test_synthetic_segment_anchors_below_lob_top():
+    amm = _amm_default()
+    spq_now = amm.spq_quality_int().as_fraction()
+    print("\n===== AMM_SYNTHETIC_SEGMENT =====")
+    q_lob_top = Quality.from_amounts(IOUAmount.from_components(1, 0), IOUAmount.from_components(1, 0))
+    q_lob_top_frac = q_lob_top.as_fraction()
+    seg = amm.synthetic_segment_for_quality(q_lob_top)
+    q_slice_frac = seg.quality.as_fraction() if seg is not None else None
+    outd = fmt_dec(amount_to_decimal(seg.out_max), places=LOG_PLACES) if seg is not None else "N/A"
+    ind = fmt_dec(amount_to_decimal(seg.in_at_out_max), places=LOG_PLACES) if seg is not None else "N/A"
+    print(f"    spq_now={float(spq_now):.6f}, q_lob_top={float(q_lob_top_frac):.6f}")
+    print(f"    seg.q={float(q_slice_frac):.6f}, out={outd}, in={ind}")
+    print(f"    range_check: lob≤slice≤spq? {q_slice_frac >= q_lob_top_frac and q_slice_frac <= spq_now}")
+    assert seg is not None, "Expected a synthetic AMM segment when AMM outruns LOB"
+    assert seg.quality.as_fraction() >= q_lob_top_frac
+    assert seg.quality.as_fraction() <= spq_now
+    amm.apply_fill_st(seg.in_at_out_max, seg.out_max)
+    spq_next = amm.spq_quality_int().as_fraction()
+    x_u, y_u = amm._reserve_units()
+    keep_fee_num = amm._keep_fee_num
+    fee_den = amm._fee_den
+    from fractions import Fraction
+    if x_u > 0:
+        tol_y = Fraction(keep_fee_num, x_u * fee_den)
+        tol_x = Fraction(y_u * keep_fee_num, (x_u * x_u) * fee_den) if y_u > 0 else Fraction(0, 1)
+        tol = tol_y if tol_y >= tol_x else tol_x
+    else:
+        tol = Fraction(0, 1)
+    # Explicitly show SPQ_next ≤ q_lob_top and any overshoot vs tolerance
+    over = (spq_next - q_lob_top_frac) if spq_next > q_lob_top_frac else Fraction(0, 1)
+    print(f"    check SPQ_next ≤ q_lob_top: {spq_next <= q_lob_top_frac} | next={float(spq_next):.6f}, lob={float(q_lob_top_frac):.6f}")
+    print(f"    Δ_over=max(next-lob,0): {float(over):.6g}")
+    print(f"    tol≈{float(tol):.3e}, within_tolerance={over <= tol}")
+    assert (spq_next <= q_lob_top_frac) or (over <= tol), (
+        f"Post-trade SPQ not anchored: next={spq_next}, lob={q_lob_top_frac}, over={over}, tol={tol}")
+
+
+def test_synthetic_segment_is_not_dust():
+    amm = _amm_default()
+    q_lob_top = Quality.from_amounts(IOUAmount.from_components(1, 0), IOUAmount.from_components(1, 0))
+
+    seg = amm.synthetic_segment_for_quality(q_lob_top)
+    print("\n===== AMM_SYNTHETIC_SEGMENT_NON_DUST =====")
+    out_units = amm._amt_to_units_floor(seg.out_max) if seg is not None else 0
+    in_units = amm._amt_to_units_floor(seg.in_at_out_max) if seg is not None else 0
+    print(f"    out_units={out_units}, in_units={in_units}, non_dust={(out_units>0 and in_units>0)}")
+    assert seg is not None
+    assert (not seg.out_max.is_zero()) and (not seg.in_at_out_max.is_zero()), "Synthetic segment produced dust"
+
+
+def test_slice_quality_never_exceeds_current_spq():
+    amm = _amm_default()
+    spq_now = amm.spq_quality_int().as_fraction()
+    print("\n===== AMM_SLICE_QUALITY_VS_SPQ =====")
+    q_lob_top = Quality.from_amounts(IOUAmount.from_components(1, 0), IOUAmount.from_components(1, 0))
+    q_lob_top_frac = q_lob_top.as_fraction()
+    seg = amm.synthetic_segment_for_quality(q_lob_top)
+    q_slice_frac = seg.quality.as_fraction() if seg is not None else None
+    print(f"    spq_now={float(spq_now):.6f}, slice_q={float(q_slice_frac):.6f}, within_limit={q_slice_frac <= spq_now}")
+    assert seg.quality.as_fraction() <= spq_now, (
+        f"Slice quality exceeds current SPQ: slice={seg.quality.as_fraction()}, spq={spq_now}")
