@@ -1,66 +1,85 @@
 """
 Ordering utilities (quality-based ranking, guardrails, and floors) aligned
-with XRPL semantics.
+with XRPL semantics (non-negative domain, explicit guard behaviour).
 
 Key behaviours:
 - Sort by bucketed quality (higher is better), with stable tie-breaking.
 - Apply a quality floor: drop segments strictly worse than a given floor.
 - Instantaneous quality guardrail: if an (out_take / in_ceiled) ratio would
   be strictly better (higher) than the segment's quoted slice quality, bump IN by
-  one native step until the implied ratio is not better (i.e., ≤ quoted). This mirrors XRPL's
-  "no better than quoted" behaviour.
+  the minimal step on the current grid so the implied ratio is ≤ quoted.
 
 Notes:
-- Uses only integer fixed-point `STAmount` and `Quality`; no Decimal.
-- Instantaneous guard uses a closed-form minimal-IN computation (no iterative bumping).
-- XRP guard operates on the drops grid (exp = -15) and ceilings to whole drops.
+- Uses integer fixed-point IOUAmount and Quality; no Decimal.
+- XRP guard operates on the drops grid (integers) and ceilings to whole drops.
 - For XRP-side IN amounts (drops), a dedicated guard is provided: 
-  	guard_instant_quality_xrp(out_take, in_drops, slice_quality).
+    guard_instant_quality_xrp(out_take, in_drops, slice_quality).
 """
 
 from __future__ import annotations
 
-from functools import cmp_to_key
 from typing import Callable, Iterable, List, Optional, TypeVar
 
-from .amounts import STAmount, st_from_drops
-from .constants import ST_MANTISSA_MIN
+from .amounts import IOUAmount, XRPAmount, _ceil_div
+from .exc import AmountDomainError, InvariantViolation
 from .quality import Quality
+
+# Debug printing control
+DEBUG_ORDERING = False
+
+def _dbg(msg: str) -> None:
+    if DEBUG_ORDERING:
+        print(msg)
+
 def guard_instant_quality_xrp(
-    out_take: STAmount,
-    in_drops: int,
+    out_take: IOUAmount,
+    in_drops: XRPAmount,
     slice_quality: Quality,
-) -> int:
-    """Closed-form XRP-side guard: return minimal drops so implied ≤ quoted."""
-    # Normalise negatives to zero drops at the boundary.
+) -> XRPAmount:
+    """Closed-form XRP-side guard: return minimal drops so implied ≤ quoted.
+
+    Preconditions:
+    - in_drops is an XRPAmount with value >= 0
+    - out_take > 0
+    - slice_quality.rate > 0
+    """
+    if in_drops.value < 0:
+        raise AmountDomainError("in_drops must be >= 0")
     if out_take.is_zero():
-        return in_drops if in_drops > 0 else 0
+        return in_drops
 
-    start = in_drops if in_drops > 0 else 0
-    in_amt = st_from_drops(start)
+    start = in_drops.value
 
-    implied = Quality.from_amounts(offer_out=out_take, offer_in=in_amt)
+    implied = Quality.from_amounts(offer_out=out_take, offer_in=in_drops)
     if not (implied.rate > slice_quality.rate):
-        return start
+        return in_drops
 
-    # Compute minimal IN amount on the XRP grid (exp = -15)
-    target_amt = _compute_min_in_on_grid(out_take, slice_quality, exp=-15)
-    # exp=-15 is the drops grid (1 drop = 10^-6 XRP); conversion to whole drops is handled below.
-
-    # Convert canonical IOU fixed-point back to whole-drop integers with ceiling.
-    # '+15' aligns the canonical mantissa scale (~1e15) to the integer drops grid (1 drop = 1e-6 XRP).
-    shift = target_amt.exponent + 15  # scale to the drops grid
+    # Compute minimal IN on the drops grid (exp = 0) so that out/in <= quoted rate.
+    # Let: out = m_o * 10^{e_o}, rate = m_q * 10^{e_q}, in = D * 10^0 (drops)
+    # Then D >= ceil( m_o * 10^{e_o - e_q} / m_q ).
+    m_o, e_o = out_take.mantissa, out_take.exponent
+    m_q, e_q = slice_quality.rate.mantissa, slice_quality.rate.exponent
+    shift = e_o - e_q
     if shift >= 0:
-        num = target_amt.mantissa * (10 ** shift)
-        den = ST_MANTISSA_MIN
+        num = m_o * (10 ** shift)
+        den = m_q
     else:
-        num = target_amt.mantissa
-        den = ST_MANTISSA_MIN * (10 ** (-shift))
+        num = m_o
+        den = m_q * (10 ** (-shift))
 
     target_drops = _ceil_div(num, den)
 
-    # Never reduce below the caller-provided ceiling
-    return target_drops if target_drops > start else start
+    # Never reduce caller-provided ceiling
+    if target_drops < start:
+        target_drops = start
+
+    # Post-check: implied(candidate) must be ≤ quoted
+    cand_amt = XRPAmount(target_drops)
+    implied_cand = Quality.from_amounts(offer_out=out_take, offer_in=cand_amt)
+    if implied_cand.rate > slice_quality.rate:
+        raise InvariantViolation(f"guard_instant_quality_xrp: implied quality still better than quoted after guard; out=({m_o},{e_o}), q=({m_q},{e_q}), in_drops={target_drops}")
+
+    return XRPAmount(target_drops)
 
 T = TypeVar("T")
 
@@ -69,11 +88,7 @@ T = TypeVar("T")
 # Internal helpers
 # ----------------------------
 
-
-
-
-
-def _implied_quality(out_take: STAmount, in_amt: STAmount) -> Quality:
+def _implied_quality(out_take: IOUAmount, in_amt: IOUAmount) -> Quality:
     """Compute implied quality as out/in (higher is better)."""
     return Quality.from_amounts(offer_out=out_take, offer_in=in_amt)
 
@@ -82,16 +97,7 @@ def _implied_quality(out_take: STAmount, in_amt: STAmount) -> Quality:
 # Closed-form helpers
 # ----------------------------
 
-def _ceil_div(a: int, b: int) -> int:
-    """Ceiling integer division for non-negative integers."""
-    if b <= 0:
-        raise ValueError("divisor must be positive")
-    if a <= 0:
-        return 0
-    return -(-a // b)
-
-
-def _compute_min_in_on_grid(out_take: STAmount, rate: Quality, exp: int) -> STAmount:
+def _compute_min_in_on_grid(out_take: IOUAmount, rate: Quality, exp: int) -> IOUAmount:
     """Closed-form minimal IN on a given exponent grid so that out/in <= rate.
 
     Using canonical values (no extra offsets):
@@ -100,14 +106,14 @@ def _compute_min_in_on_grid(out_take: STAmount, rate: Quality, exp: int) -> STAm
       IN'  = m_i * 10^{exp}
     Choose IN' exponent = `exp`; then:
       m_i >= ceil( m_o * 10^{e_o - e_q - exp} / m_q )
-    Finally normalise via STAmount.from_components.
+    Finally normalise via IOUAmount.from_components.
     """
     if out_take.is_zero():
-        return STAmount.from_components(ST_MANTISSA_MIN, exp, 1)
+        # Minimal IN to satisfy inequality is zero; caller typically handles zero earlier.
+        return IOUAmount.zero()
 
     m_o, e_o = out_take.mantissa, out_take.exponent
     m_q, e_q = rate.rate.mantissa, rate.rate.exponent
-    # STAmount numeric value is mantissa * 10^exponent; rearrangement gives shift = e_o - e_q - exp.
     shift = e_o - e_q - exp
     if shift >= 0:
         num = m_o * (10 ** shift)
@@ -117,8 +123,7 @@ def _compute_min_in_on_grid(out_take: STAmount, rate: Quality, exp: int) -> STAm
         den = m_q * (10 ** (-shift))
 
     m_needed = _ceil_div(num, den)
-    # Positive IN by construction. Normalisation handled by constructor.
-    return STAmount.from_components(m_needed, exp, 1)
+    return IOUAmount.from_components(m_needed, exp)
 
 
 # ----------------------------
@@ -126,25 +131,35 @@ def _compute_min_in_on_grid(out_take: STAmount, rate: Quality, exp: int) -> STAm
 # ----------------------------
 
 def guard_instant_quality(
-    out_take: STAmount,
-    in_ceiled: STAmount,
+    out_take: IOUAmount,
+    in_ceiled: IOUAmount,
     slice_quality: Quality,
-) -> STAmount:
+) -> IOUAmount:
     """Closed-form: ensure implied instant quality does not beat the quoted slice quality."""
+    if in_ceiled.is_zero():
+        # No input budget -> nothing to guard; caller may handle this earlier.
+        return in_ceiled
     if out_take.is_zero():
         return in_ceiled
 
     implied = _implied_quality(out_take, in_ceiled)
     if not (implied.rate > slice_quality.rate):
-        # Already not better than quoted (i.e. <= quoted)
         return in_ceiled
 
     # Compute minimal IN on the current grid that enforces implied <= quoted
+    m_o, e_o = out_take.mantissa, out_take.exponent
+    m_q, e_q = slice_quality.rate.mantissa, slice_quality.rate.exponent
     candidate = _compute_min_in_on_grid(out_take, slice_quality, in_ceiled.exponent)
 
     # Respect caller's ceiling (never reduce IN)
     if candidate < in_ceiled:
-        return in_ceiled
+        candidate = in_ceiled
+
+    # Post-check: implied(candidate) must be ≤ quoted
+    implied_cand = _implied_quality(out_take, candidate)
+    if implied_cand.rate > slice_quality.rate:
+        raise InvariantViolation(f"guard_instant_quality: implied quality still better than quoted after guard; out=({m_o},{e_o}), q=({m_q},{e_q}), in_candidate=({candidate.mantissa},{candidate.exponent})")
+
     return candidate
 
 
@@ -168,39 +183,18 @@ def apply_quality_floor(
     return [x for x in items if get_quality(x).rate >= qmin.rate]
 
 
-def _cmp_quality_then_index(
-    a: T,
-    b: T,
-    get_quality: Callable[[T], Quality],
-    get_index: Callable[[T], int],
-) -> int:
-    qa = get_quality(a)
-    qb = get_quality(b)
-    if qa.rate > qb.rate:
-        return -1
-    if qa.rate < qb.rate:
-        return 1
-    ia = get_index(a)
-    ib = get_index(b)
-    if ia < ib:
-        return -1
-    if ia > ib:
-        return 1
-    return 0
-
-
 def stable_sort_by_quality(
     items: Iterable[T],
     *,
     get_quality: Callable[[T], Quality],
-    get_index: Callable[[T], int],
 ) -> List[T]:
-    """Stable sort by quality (descending, higher is better),
-    with insertion-index tie-breaker.
+    """Stable sort by quality (descending, higher is better).
+
+    Python's built-in sort is stable, so items with equal quality retain their
+    original insertion order.
     """
     lst = list(items)
-    key = cmp_to_key(lambda a, b: _cmp_quality_then_index(a, b, get_quality, get_index))
-    return sorted(lst, key=key)
+    return sorted(lst, key=lambda x: get_quality(x), reverse=True)
 
 
 def prepare_and_order(
@@ -208,16 +202,18 @@ def prepare_and_order(
     *,
     qmin: Optional[Quality],
     get_quality: Callable[[T], Quality],
-    get_index: Callable[[T], int],
 ) -> List[T]:
     """Apply quality floor, then stable sort by quality.
 
     Guardrails (instant quality bump) are expected to be applied by the caller
     per-fill since they depend on `out_take` and provisional `in_ceiled` for
     each slice.
+
+    Python's built-in sort is stable, so items with equal quality retain their
+    original insertion order.
     """
     filtered = apply_quality_floor(items, qmin=qmin, get_quality=get_quality)
-    return stable_sort_by_quality(filtered, get_quality=get_quality, get_index=get_index)
+    return stable_sort_by_quality(filtered, get_quality=get_quality)
 
 
 __all__ = [

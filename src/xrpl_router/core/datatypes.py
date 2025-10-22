@@ -5,8 +5,8 @@ These datatypes are intentionally minimal and immutable (where appropriate)
 so that ordering and execution logic can remain deterministic and testable.
 
 Notes:
-- Amounts use `STAmount` (IOU fixed-point). XRP amounts are handled as integer drops by callers or bridged into `STAmount` for quality.
-- `Quality` wraps an STAmount-encoded rate (offerOut / offerIn), higher is better.
+- Amounts use XRPAmount (drops) and IOUAmount (IOU fixed-point). No STAmount bridging.
+- `Quality` wraps an IOUAmount-encoded rate (offerOut / offerIn), higher is better.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Literal
 
-from .amounts import STAmount
+from .amounts import XRPAmount, IOUAmount, Amount
 from .quality import Quality
 
 
@@ -29,19 +29,16 @@ class Segment:
     Fields:
     - src: source type tag ("AMM" or "CLOB"). Used for tie-breaks and AMM-residual rules.
     - quality: quoted OUT/IN quality (higher is better). Integer-domain Quality.
-    - out_max: maximum OUT available on this slice (STAmount).
-    - in_at_out_max: IN required to exhaust out_max at quoted quality (STAmount).
-    - in_is_xrp/out_is_xrp: asset type flags for I/O boundary handling (display/bridges).
+    - out_max: maximum OUT available on this slice (Amount = XRPAmount or IOUAmount).
+    - in_at_out_max: IN required to exhaust out_max at quoted quality (Amount = XRPAmount or IOUAmount).
     - raw_quality: optional raw quality as originated by the source (often same as quality).
     - source_id: optional identifier for bookkeeping/debugging.
     """
 
     src: Literal["AMM", "CLOB"]
     quality: Quality
-    out_max: STAmount
-    in_at_out_max: STAmount
-    in_is_xrp: bool = False
-    out_is_xrp: bool = False
+    out_max: Amount
+    in_at_out_max: Amount
     raw_quality: Optional[Quality] = None
     source_id: Optional[str] = None
 
@@ -70,8 +67,8 @@ class Fill:
     """
 
     segment_id: int
-    out_taken: STAmount
-    in_paid: STAmount
+    out_taken: Amount
+    in_paid: Amount
 
 
 @dataclass

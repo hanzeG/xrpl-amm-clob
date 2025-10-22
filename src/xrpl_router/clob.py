@@ -12,20 +12,15 @@ Helpers (public):
 All functions return taker-view segments; issuer OUT-side fees are deferred to execution-time (BookStep).
 """
 
-# NOTE:
-#   This module performs Decimal-based rounding only at the I/O boundary (price and liquidity inputs).
-#   All subsequent computations, sorting, and quality comparisons are performed in the integer domain
-#   via STAmount and Quality. This matches XRPL's ledger semantics where all amounts are integer-scaled.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Iterable, List
 
+from .core import Amount, Quality, XRPAmount, IOUAmount, round_in_min, round_out_max
+from .core.fmt import XRP_QUANTUM, IOU_QUANTUM
 from .core.datatypes import Segment
-from .core.amounts import STAmount, round_in_min, round_out_max
-from .core.quality import Quality
 
 # Local Decimal helpers (I/O boundary only)
 DecimalLike = Decimal | int | str
@@ -91,21 +86,28 @@ class Clob:
             if in_gross <= 0:
                 continue
             # Convert to integer-domain amounts.
-            out_st = STAmount.from_decimal(out_gross)
-            in_st = STAmount.from_decimal(in_gross)
+            if self.out_is_xrp:
+                out_units = int((out_gross / XRP_QUANTUM).to_integral_value(rounding=ROUND_DOWN))
+                out_st = XRPAmount(out_units)
+            else:
+                out_units = int((out_gross / IOU_QUANTUM).to_integral_value(rounding=ROUND_DOWN))
+                out_st = IOUAmount.from_components(out_units, -15)
+            if self.in_is_xrp:
+                in_units = int((in_gross / XRP_QUANTUM).to_integral_value(rounding=ROUND_UP))
+                in_st = XRPAmount(in_units)
+            else:
+                in_units = int((in_gross / IOU_QUANTUM).to_integral_value(rounding=ROUND_UP))
+                in_st = IOUAmount.from_components(in_units, -15)
             # Compute integer-domain quality and validate positivity.
             q = Quality.from_amounts(offer_out=out_st, offer_in=in_st)
-            if q.rate.sign <= 0:
+            # Positivity implied by non-zero amounts; skip only if either side is zero
+            if out_st.is_zero() or in_st.is_zero():
                 continue
             segs.append(Segment(
                 src="CLOB",
                 quality=q,
                 out_max=out_st,
                 in_at_out_max=in_st,
-                in_is_xrp=self.in_is_xrp,
-                out_is_xrp=self.out_is_xrp,
-                raw_quality=q,
-                source_id=None,
             ))
 
         # Sort by integer-domain quality (highest first).
@@ -207,18 +209,12 @@ def normalise_segments(segs: Iterable[Segment]) -> List[Segment]:
             continue
         if s.in_at_out_max.is_zero():
             continue
-        q = s.quality if s.quality.rate.sign > 0 else s.implied_quality()
-        if q.rate.sign <= 0:
-            continue
+        # Amounts are already snapped to grids; provided quality is assumed valid when amounts are positive
         out.append(Segment(
             src=s.src,
-            quality=q,
+            quality=s.quality,
             out_max=s.out_max,
             in_at_out_max=s.in_at_out_max,
-            in_is_xrp=s.in_is_xrp,
-            out_is_xrp=s.out_is_xrp,
-            raw_quality=s.raw_quality or q,
-            source_id=getattr(s, "source_id", None),
         ))
     # Sort by numeric rate: (exponent, mantissa) descending
     out.sort(key=lambda z: (z.quality.rate.exponent, z.quality.rate.mantissa), reverse=True)

@@ -3,25 +3,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Tuple, Callable
 
-from .amm_context import AMMContext
-from .core import STAmount, Quality
+from .core import Amount, Quality, XRPAmount, IOUAmount
 
 # ----------------------------
 # Integer-domain helpers
 # ----------------------------
 
-ZERO = STAmount.zero()
+def _zero_like(x: Amount) -> Amount:
+    """Return a zero Amount of the same concrete type as x."""
+    return XRPAmount(0) if isinstance(x, XRPAmount) else IOUAmount.zero()
 
-
-def _gt_zero(x: STAmount) -> bool:
-    return (not x.is_zero()) and (x > ZERO)
+def _gt_zero(x: Amount) -> bool:
+    z = _zero_like(x)
+    return (not x.is_zero()) and (x > z)
 
 
 def _compose_path_quality(step_quals: List[Quality]) -> Optional[Quality]:
     """Multiply per-step qualities to get a composed path quality.
 
-    Quality is an STAmount-based rate. We multiply mantissas and add exponents
-    in the integer domain, then normalise via STAmount.from_components.
+    Quality is an Amount-based rate. We multiply mantissas and add exponents
+    in the integer domain, then normalise via IOUAmount.from_components.
     """
     if not step_quals:
         return None
@@ -33,7 +34,7 @@ def _compose_path_quality(step_quals: List[Quality]) -> Optional[Quality]:
             return None
         m *= q.rate.mantissa
         e += q.rate.exponent
-    rate = STAmount.from_components(m, e, 1)
+    rate = IOUAmount.from_components(m, e)
     if rate.is_zero():
         return None
     return Quality(rate)
@@ -47,21 +48,19 @@ def _compose_path_quality(step_quals: List[Quality]) -> Optional[Quality]:
 class PaymentSandbox:
     """Stage AMM/CLOB writebacks between reverse and forward passes.
 
-    Values are tracked as STAmount pairs (dx, dy). The actual sink is injected
+    Values are tracked as Amount pairs (dx, dy). The actual sink is injected
     by the caller (e.g., to mutate pools/books) and is only called on success.
     """
-    staged: List[Tuple[STAmount, STAmount]]
+    staged: List[Tuple[Amount, Amount]]
 
     def __init__(self) -> None:
         self.staged = []
 
-    def stage_after_iteration(self, dx: STAmount, dy: STAmount) -> None:
+    def stage_after_iteration(self, dx: Amount, dy: Amount) -> None:
         self.staged.append((dx, dy))
 
-    def stage_fee(self, dx: STAmount, dy: STAmount) -> None:
-        self.staged.append((dx, dy))
 
-    def apply(self, sink: Optional[Callable[[STAmount, STAmount], None]]) -> None:
+    def apply(self, sink: Optional[Callable[[Amount, Amount], None]]) -> None:
         if sink is None:
             self.staged.clear()
             return
@@ -77,33 +76,36 @@ class PaymentSandbox:
 def flow(
     payment_sandbox: PaymentSandbox,
     strands: Iterable[List["Step"]],  # runtime duck-typed; must expose quality_upper_bound/rev/fwd
-    out_req: STAmount,
+    out_req: Amount,
     *,
-    send_max: Optional[STAmount] = None,
+    send_max: Optional[Amount] = None,
     limit_quality: Optional[Quality] = None,   # optional composed-path floor
-    amm_context: Optional[AMMContext] = None,
-    apply_sink: Optional[Callable[[STAmount, STAmount], None]] = None,
-) -> Tuple[STAmount, STAmount]:
+    apply_sink: Optional[Callable[[Amount, Amount], None]] = None,
+) -> Tuple[Amount, Amount]:
     """Execute strands per whitepaper (§1.3.2) in the integer domain.
 
-    Returns a pair (total_in, total_out) as STAmount. The caller is responsible
+    Returns a pair (total_in, total_out) as Amount. The caller is responsible
     for any Decimal/display conversion at I/O boundaries.
     """
     if out_req.is_zero() or not _gt_zero(out_req):
-        return (ZERO, ZERO)
+        z = _zero_like(out_req)
+        return (z, z)
 
     # Materialise strands for deterministic iteration across rounds
     strands = list(strands)
 
-    remaining_out: STAmount = out_req
-    remaining_in: Optional[STAmount] = send_max
-
-    actual_in = ZERO
-    actual_out = ZERO
+    remaining_out: Amount = out_req
+    remaining_in: Optional[Amount] = send_max
+    actual_in: Optional[Amount] = None
+    actual_out: Amount = _zero_like(out_req)
 
     iters = 0
 
-    while _gt_zero(remaining_out) and (remaining_in is None or remaining_in >= ZERO):
+    while _gt_zero(remaining_out) and (remaining_in is None or remaining_in >= _zero_like(remaining_in)):
+        # The above allows remaining_in to be zero or positive; negative breaks.
+        if remaining_in is not None and remaining_in < _zero_like(remaining_in):
+            break
+
         # Collect active candidates with composed path quality
         active: List[Tuple[Quality, List["Step"]]] = []
         for strand in strands:
@@ -125,12 +127,6 @@ def flow(
         # Python's sort is stable, so equal keys preserve insertion order as a tie-break.
         active.sort(key=lambda t: (t[0].rate.exponent, t[0].rate.mantissa), reverse=True)
 
-        # Set multipath flag (best-effort)
-        if amm_context is not None:
-            try:
-                amm_context.setMultiPath(len(active) > 1)
-            except Exception:
-                pass
 
         # Try candidates sequentially until one succeeds
         attempt_succeeded = False
@@ -143,9 +139,9 @@ def flow(
 
             for rev_pos, step in enumerate(reversed(best)):
                 idx_forward = n_steps - 1 - rev_pos
-                _in, _out = step.rev(sb, need)  # returns STAmount pairs
+                _in, _out = step.rev(sb, need)  # returns Amount pairs
                 if not _gt_zero(_out):
-                    need = ZERO
+                    need = _zero_like(_out)
                     limiting_idx = idx_forward
                     break
                 if _out < need:
@@ -167,8 +163,8 @@ def flow(
                 in_cap0 = required_in
 
             # Forward replay from start_idx to end
-            in_spent_add = ZERO
-            out_propagate = ZERO
+            in_spent_add = _zero_like(out_req)
+            out_propagate = _zero_like(out_req)
             ok = True
             for i in range(start_idx, len(best)):
                 step_i = best[i]
@@ -189,9 +185,12 @@ def flow(
                 continue
 
             # Commit accounting for the successful candidate
-            actual_in = actual_in + in_spent_add
             actual_out = actual_out + out_propagate
             remaining_out = out_req - actual_out
+            if actual_in is None:
+                actual_in = in_spent_add
+            else:
+                actual_in = actual_in + in_spent_add
             if remaining_in is not None:
                 remaining_in = remaining_in - in_spent_add
 
@@ -206,4 +205,6 @@ def flow(
         if iters >= 128:  # MAX_FLOW_ITERS (kept local)
             break
 
+    if actual_in is None:
+        actual_in = _zero_like(out_req)
     return actual_in, actual_out

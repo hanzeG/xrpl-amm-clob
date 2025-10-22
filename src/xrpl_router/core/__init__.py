@@ -3,16 +3,15 @@ XRPL Router Core
 ==================
 
 Unified exports for integer-domain primitives and utilities aligned with rippled semantics.
-All arithmetic follows XRPL-style STAmount normalisation and rounding rules.
+All arithmetic follows XRPL-style normalisation and rounding rules.
 Decimal helpers are provided *only* for I/O formatting.
 
-Numerical convention: IOU STAmount encodes values as mantissa * 10^exponent with
-mantissa in [1e15, 1e16-1]. XRP uses integer drops at the I/O boundary.
+Core exposes XRPAmount (drops) and IOUAmount (fixed-point) as public API.
 """
 
 # NOTE:
 #   The `core` package defines the integer-domain primitives and arithmetic used
-#   across the router. All computations are performed on STAmount and Quality objects
+#   across the router. All computations are performed on XRPAmount and IOUAmount objects
 #   following XRPL ledger rules for mantissa/exponent scaling, rounding, and normalization.
 #   Decimal functions exist only for I/O formatting and display.
 
@@ -29,22 +28,27 @@ from .constants import (
 # Decimal formatting helpers (non-core arithmetic)
 from .fmt import (
     DEFAULT_DECIMAL_PRECISION,
+    fmt_dec,
+    round_in_min,
+    round_out_max,
+)
+
+# Decimal quanta (formatting helpers)
+from .constants import (
     XRP_QUANTUM,
     IOU_QUANTUM,
     QUALITY_QUANTUM,
     DEFAULT_QUANTUM,
-    fmt_dec,
 )
 
 # Amount primitives and bridges
 from .amounts import (
-    STAmount,
-    st_from_drops,
+    Amount,
+    XRPAmount,
+    IOUAmount,
     drops_from_xrp_in,
     drops_from_xrp_out,
     xrp_from_drops,
-    round_in_min,
-    round_out_max,
 )
 
 # Quality (price-like ratio)
@@ -69,6 +73,9 @@ from .datatypes import (
     RouteResult,
 )
 
+# Core exceptions
+from .exc import AmountDomainError, NormalisationError, InvariantViolation
+
 __all__ = [
     # constants
     "ST_MANTISSA_DIGITS",
@@ -85,8 +92,9 @@ __all__ = [
     "DEFAULT_QUANTUM",
     "fmt_dec",
     # amounts
-    "STAmount",
-    "st_from_drops",
+    "Amount",
+    "XRPAmount",
+    "IOUAmount",
     "drops_from_xrp_in",
     "drops_from_xrp_out",
     "xrp_from_drops",
@@ -105,4 +113,8 @@ __all__ = [
     "Fill",
     "ExecutionReport",
     "RouteResult",
+    # exceptions
+    "AmountDomainError",
+    "NormalisationError",
+    "InvariantViolation",
 ]

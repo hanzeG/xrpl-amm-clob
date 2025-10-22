@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Tuple, TYPE_CHECKING
-from .core import STAmount, Quality
+from .core import Amount, Quality, XRPAmount
 
 if TYPE_CHECKING:
     from .flow import PaymentSandbox
@@ -16,20 +16,20 @@ class Step:
     advertise a conservative quality upper bound for sorting (multi-path).
     """
 
-    _cached_in: STAmount
-    _cached_out: STAmount
+    _cached_in: Amount
+    _cached_out: Amount
 
-    def rev(self, sandbox: "PaymentSandbox", out_req: STAmount) -> Tuple[STAmount, STAmount]:
+    def rev(self, sandbox: "PaymentSandbox", out_req: Amount) -> Tuple[Amount, Amount]:
         raise NotImplementedError
 
-    def fwd(self, sandbox: "PaymentSandbox", in_cap: STAmount) -> Tuple[STAmount, STAmount]:
+    def fwd(self, sandbox: "PaymentSandbox", in_cap: Amount) -> Tuple[Amount, Amount]:
         raise NotImplementedError
 
     def quality_upper_bound(self) -> Quality:
         raise NotImplementedError
 
-    def cached_in(self) -> STAmount:
-        return getattr(self, "_cached_in", STAmount.zero())
+    def cached_in(self) -> Amount:
+        return getattr(self, "_cached_in", XRPAmount(0))
 
-    def cached_out(self) -> STAmount:
-        return getattr(self, "_cached_out", STAmount.zero())
+    def cached_out(self) -> Amount:
+        return getattr(self, "_cached_out", XRPAmount(0))
