@@ -1,5 +1,3 @@
-# Model Zone
+# Model
 
-Model implementation lives in:
-
-- `src/xrpl_router/`
+Core model code: `src/xrpl_router/`.

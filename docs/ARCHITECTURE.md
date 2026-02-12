@@ -1,18 +1,13 @@
 # Architecture
 
-This repository is organized into clear zones with stable script entry points.
-
 ## Zones
+- `src/xrpl_router/`: model core
+- `empirical/scripts/`: active empirical workflows
+- `empirical/scripts_archive/`: historical one-off scripts
+- `apps/`: stable CLI launchers
+- `tests/`: validation
+- `artifacts/`: output datasets
 
-- `src/xrpl_router/`: model core (routing logic, AMM/CLOB math, quality/ordering)
-- `empirical/`: empirical workflows (data discovery/export/trace/analysis)
-- `apps/`: stable CLI entry points for model and empirical jobs
-- `tests/`: unit/integration/example tests
-- `artifacts/`: generated outputs (parquet/csv/ndjson/log), not tracked by git
-
-## Operational Notes
-
-- Model and empirical code paths are separated.
-- Empirical active scripts live in `empirical/scripts/`; archived one-off scripts live in `empirical/scripts_archive/`.
-- Empirical scripts are invoked via `apps/run_empirical.py`.
-- Generated outputs are stored under `artifacts/`.
+## Execution Entry Points
+- Model: `python apps/run_model.py <alias>`
+- Empirical: `python apps/run_empirical.py <alias>`

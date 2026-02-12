@@ -1,5 +1,5 @@
-# Archived Empirical Scripts
+# Archived Scripts
 
-This directory stores historical or one-off empirical scripts that are not part of the active supported workflow.
+Historical one-off empirical scripts.
 
-Active workflows are maintained under `empirical/scripts/` and launched through `apps/run_empirical.py`.
+Use active workflows in `empirical/scripts/` via `apps/run_empirical.py`.

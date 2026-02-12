@@ -1,14 +1,11 @@
 # Artifacts
 
-Generated datasets and experiment outputs are stored under this directory.
+Generated outputs only.
 
 ## Layout
-
-- `exports/<pair>/ledger_<start>_<end>/`: exported AMM/CLOB/fees windows
-- `compare/<pair>/ledger_<start>_<end>/`: comparison outputs
-- `model_input/<pair>/ledger_<start>_<end>/`: generated model input files
+- `exports/<pair>/ledger_<start>_<end>/`
+- `compare/<pair>/ledger_<start>_<end>/`
+- `model_input/<pair>/ledger_<start>_<end>/`
 
 ## Policy
-
-- Do not commit files under `artifacts/`
-- Keep source code and configs outside `artifacts/`
+- Do not commit files under `artifacts/`.
