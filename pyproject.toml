@@ -19,7 +19,7 @@ package-dir = { "" = "src" } # top-level package directory points to src
 
 [tool.pytest.ini_options]
 # addopts = "-q -ra --strict-markers --disable-warnings --cov=src/xrpl_router --cov-report=term-missing --cov-fail-under=0"
-addopts = "-q -s"
+addopts = "-q"
 testpaths = ["tests"]
 
 [tool.ruff]
