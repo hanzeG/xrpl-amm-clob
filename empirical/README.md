@@ -7,5 +7,19 @@ Empirical workflows include:
 - Windowed comparison and diagnostics
 
 Scripts are now in `empirical/scripts/`.
-Legacy `data/*.py` commands are kept as compatibility shims.
 Use `apps/run_empirical.py` as the stable launcher.
+Local Delta Sharing token should be stored in `data/config.share` (copied from `data/config.share.example`).
+
+Research-focused scripts are consolidated as:
+- `empirical/scripts/research_compare_rolling.py`
+- `empirical/scripts/research_compare_single.py`
+- `empirical/scripts/research_analyse_traces.py`
+- `empirical/scripts/research_enrich_clob_with_tx_index.py`
+- `empirical/scripts/research_check_parquet_bounds.py`
+
+Examples:
+- `python apps/run_empirical.py pipeline-export-window -- --pair rlusd_xrp --ledger-start <n> --ledger-end <n> --output-dir artifacts/exports/rlusd_xrp/ledger_<start>_<end>`
+- `python apps/run_empirical.py pipeline-build-model-input -- --input-amm <amm_parquet> --input-clob <clob_parquet> --input-fees <fees_parquet> --pair rlusd_xrp --ledger-start <n> --ledger-end <n>`
+- `python apps/run_empirical.py research-compare-rolling -- --root <window_dir> --pair rlusd_xrp --ledger-start <n> --ledger-end <n> --output-dir artifacts/compare/rlusd_xrp/ledger_<start>_<end>`
+- `python apps/run_empirical.py research-compare-single -- --root <window_dir> --pair rlusd_xrp --ledger-start <n> --ledger-end <n> --output-dir artifacts/compare/rlusd_xrp/ledger_<start>_<end>`
+- `python apps/run_empirical.py pipeline-run -- --pair rlusd_xrp --ledger-start <n> --ledger-end <n> --book-gets-xrp <book_gets_xrp.ndjson> --book-gets-rusd <book_gets_rusd.ndjson>`
