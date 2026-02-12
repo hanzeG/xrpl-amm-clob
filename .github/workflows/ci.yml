@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest
+
+      - name: Run pytest smoke suite
+        run: |
+          python -m pytest -q tests/ci
+
+      - name: Validate empirical pipeline dry-run
+        run: |
+          python apps/run_empirical.py pipeline-run -- \
+            --pair rlusd_xrp \
+            --ledger-start 1 \
+            --ledger-end 2 \
+            --book-gets-xrp dummy_x.ndjson \
+            --book-gets-rusd dummy_y.ndjson \
+            --dry-run
