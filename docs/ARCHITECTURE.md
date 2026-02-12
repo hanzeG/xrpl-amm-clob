@@ -1,6 +1,6 @@
 # Architecture
 
-This repository is now organized into clear zones with single-path script layout.
+This repository is organized into clear zones with stable script entry points.
 
 ## Zones
 
@@ -10,18 +10,8 @@ This repository is now organized into clear zones with single-path script layout
 - `tests/`: unit/integration/example tests
 - `artifacts/`: generated outputs (parquet/csv/ndjson/log), not tracked by git
 
-## Current Status
+## Operational Notes
 
-Repository cleanup status:
-
-- No model behavior changes
-- No algorithm changes in empirical scripts
-- Empirical scripts live in `empirical/scripts/`
-- No compatibility shims are kept under `data/`
-- Legacy root-level outputs were migrated to `artifacts/snapshots/legacy_root/`
-
-## Migration Plan (Next Phases)
-
-1. Extract shared empirical utilities (Delta Sharing load/filter/write)
-2. Move stable configs to `configs/`
-3. Normalize defaults from `data/output*` toward `artifacts/` over time
+- Model and empirical code paths are separated.
+- Empirical scripts live in `empirical/scripts/` and are invoked via `apps/run_empirical.py`.
+- Generated outputs are stored under `artifacts/`.

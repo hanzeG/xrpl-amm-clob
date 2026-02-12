@@ -2,7 +2,7 @@
 
 This repository provides a modelling and simulation toolkit to study **execution efficiency** on XRPL across AMM and CLOB venues. It centralises Decimal policy (precision, quantum, rounding) so AMM, CLOB and the router share identical arithmetic.
 
-## Repository Zones (Phase 1)
+## Repository Structure
 - `src/xrpl_router/`: model implementation
 - `empirical/`: empirical/data workflow zone
 - `apps/`: stable launchers for scripts

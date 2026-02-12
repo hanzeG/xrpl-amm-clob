@@ -43,9 +43,14 @@ pip-wheel-metadata/
 # Python version managers
 .python-version
 
-# Phase-1 repository zoning
+# Generated outputs
 artifacts/*
 !artifacts/.gitkeep
 !artifacts/README.md
 data/output/
 data/output_csv/
+
+# Local credentials (never commit)
+data/config.share
+data/*.share
+!data/*.share.example
