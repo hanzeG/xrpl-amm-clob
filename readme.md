@@ -15,6 +15,8 @@ python -m pip install -e .
 pytest -q tests/ci
 ```
 
+Command reference: `docs/COMMANDS.md`
+
 ## Main Commands
 ```bash
 python apps/run_model.py amm-only
@@ -27,5 +29,5 @@ python apps/run_empirical.py pipeline-run -- \
 ```
 
 ## Notes
-- Empirical defaults are in `configs/empirical/pipeline_run.default.json`.
+- Empirical defaults are centralized in `configs/empirical/pipeline_run.default.json`.
 - Credentials are local-only via `data/config.share` (template: `data/config.share.example`).

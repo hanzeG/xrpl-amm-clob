@@ -21,6 +21,8 @@ python apps/run_empirical.py pipeline-run -- \
   --book-gets-rusd <book_gets_rusd.ndjson>
 ```
 
+Command reference: `docs/COMMANDS.md`
+
 ## Credentials
 - Local token: `data/config.share`
 - Template: `data/config.share.example`
