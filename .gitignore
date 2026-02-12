@@ -54,3 +54,7 @@ data/output_csv/
 data/config.share
 data/*.share
 !data/*.share.example
+
+# Local data workspace (keep only templates under version control)
+data/*
+!data/*.share.example
