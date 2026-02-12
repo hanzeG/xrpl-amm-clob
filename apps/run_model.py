@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 SCRIPT_MAP = {
-    "amm-only": "src/real/run_amm_only_from_input.py",
-    "hybrid-one-tx": "src/real/run_hybrid_one_tx_from_windows.py",
+    "amm-only": "apps/model/run_amm_only_from_input.py",
+    "hybrid-one-tx": "apps/model/run_hybrid_one_tx_from_windows.py",
 }
 
 

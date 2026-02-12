@@ -2,6 +2,7 @@
 
 ## Zones
 - `src/xrpl_router/`: model core
+- `apps/model/`: model execution scripts
 - `empirical/scripts/`: active empirical workflows
 - `empirical/scripts_archive/`: historical one-off scripts
 - `apps/`: stable CLI launchers
