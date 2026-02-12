@@ -13,5 +13,6 @@ This repository is organized into clear zones with stable script entry points.
 ## Operational Notes
 
 - Model and empirical code paths are separated.
-- Empirical scripts live in `empirical/scripts/` and are invoked via `apps/run_empirical.py`.
+- Empirical active scripts live in `empirical/scripts/`; archived one-off scripts live in `empirical/scripts_archive/`.
+- Empirical scripts are invoked via `apps/run_empirical.py`.
 - Generated outputs are stored under `artifacts/`.

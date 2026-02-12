@@ -4,23 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import runpy
 import sys
 from pathlib import Path
 
 
 SCRIPT_MAP = {
-    "discovery": "empirical/scripts/discovery.py",
-    "analyse": "empirical/scripts/analyse.py",
     "check-freshness": "empirical/scripts/check_delta_sharing_freshness.py",
-    "export-window": "empirical/scripts/pipeline_export_window.py",
-    "export-fees-window": "empirical/scripts/pipeline_export_window.py",
-    "build-input": "empirical/scripts/pipeline_build_model_input.py",
-    "inspect-window": "empirical/scripts/inspect_window.py",
-    "inspect-hybrid-tx": "empirical/scripts/inspect_hybrid_path_one_tx.py",
-    "scan-hybrid": "empirical/scripts/scan_hybrid_candidates_20251201.py",
-    "trace-ledger": "empirical/scripts/trace_ledger_rusd_xrp_1215.py",
-    "compare-vs-model": "empirical/scripts/compare_rusd_xrp_100894647_vs_model.py",
+    "download-clob-offers-range": "empirical/scripts/download_clob_offers_range.py",
     "test-share-profile": "empirical/scripts/test_delta_sharing_profile.py",
     "research-compare-rolling": "empirical/scripts/research_compare_rolling.py",
     "research-compare-single": "empirical/scripts/research_compare_single.py",
@@ -53,15 +45,16 @@ def _run_script(root: Path, rel_path: str, script_args: list[str]) -> None:
 
 def _parse_pipeline_args(raw: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="One-shot empirical pipeline runner.")
-    p.add_argument("--pair", default="rlusd_xrp")
-    p.add_argument("--ledger-start", type=int, required=True)
-    p.add_argument("--ledger-end", type=int, required=True)
-    p.add_argument("--share-profile", default="data/config.share")
-    p.add_argument("--share", default="ripple-ubri-share")
-    p.add_argument("--schema", default="ripplex")
-    p.add_argument("--table-amm", default="fact_amm_swaps")
-    p.add_argument("--table-clob", default="offers_fact_tx")
-    p.add_argument("--table-fees", default="fact_amm_fees")
+    p.add_argument("--config", default="configs/empirical/pipeline_run.default.json")
+    p.add_argument("--pair", default=None)
+    p.add_argument("--ledger-start", type=int, default=None)
+    p.add_argument("--ledger-end", type=int, default=None)
+    p.add_argument("--share-profile", default=None)
+    p.add_argument("--share", default=None)
+    p.add_argument("--schema", default=None)
+    p.add_argument("--table-amm", default=None)
+    p.add_argument("--table-clob", default=None)
+    p.add_argument("--table-fees", default=None)
     p.add_argument("--book-gets-xrp", default=None, help="Required for compare step unless --skip-compare")
     p.add_argument("--book-gets-rusd", default=None, help="Required for compare step unless --skip-compare")
     p.add_argument("--exports-dir", default=None)
@@ -76,11 +69,29 @@ def _parse_pipeline_args(raw: list[str]) -> argparse.Namespace:
 
 def _run_pipeline(root: Path, raw_args: list[str]) -> int:
     args = _parse_pipeline_args(raw_args)
-    window = f"ledger_{args.ledger_start}_{args.ledger_end}"
+    cfg_path = root / args.config
+    cfg_data = {}
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg_data = json.load(f)
 
-    exports_dir = args.exports_dir or f"artifacts/exports/{args.pair}/{window}"
-    model_input_dir = args.model_input_dir or f"artifacts/model_input/{args.pair}/{window}"
-    compare_dir = args.compare_dir or f"artifacts/compare/{args.pair}/{window}"
+    pair = args.pair or cfg_data.get("pair", "rlusd_xrp")
+    ledger_start = args.ledger_start if args.ledger_start is not None else cfg_data.get("ledger_start")
+    ledger_end = args.ledger_end if args.ledger_end is not None else cfg_data.get("ledger_end")
+    if ledger_start is None or ledger_end is None:
+        raise SystemExit("pipeline-run requires --ledger-start and --ledger-end (or defaults in --config).")
+    share_profile = args.share_profile or cfg_data.get("share_profile", "data/config.share")
+    share = args.share or cfg_data.get("share", "ripple-ubri-share")
+    schema = args.schema or cfg_data.get("schema", "ripplex")
+    table_amm = args.table_amm or cfg_data.get("table_amm", "fact_amm_swaps")
+    table_clob = args.table_clob or cfg_data.get("table_clob", "offers_fact_tx")
+    table_fees = args.table_fees or cfg_data.get("table_fees", "fact_amm_fees")
+
+    window = f"ledger_{ledger_start}_{ledger_end}"
+
+    exports_dir = args.exports_dir or f"artifacts/exports/{pair}/{window}"
+    model_input_dir = args.model_input_dir or f"artifacts/model_input/{pair}/{window}"
+    compare_dir = args.compare_dir or f"artifacts/compare/{pair}/{window}"
 
     planned: list[tuple[str, list[str]]] = []
 
@@ -90,23 +101,23 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
                 "empirical/scripts/pipeline_export_window.py",
                 [
                     "--pair",
-                    args.pair,
+                    pair,
                     "--ledger-start",
-                    str(args.ledger_start),
+                    str(ledger_start),
                     "--ledger-end",
-                    str(args.ledger_end),
+                    str(ledger_end),
                     "--share-profile",
-                    args.share_profile,
+                    share_profile,
                     "--share",
-                    args.share,
+                    share,
                     "--schema",
-                    args.schema,
+                    schema,
                     "--table-amm",
-                    args.table_amm,
+                    table_amm,
                     "--table-clob",
-                    args.table_clob,
+                    table_clob,
                     "--table-fees",
-                    args.table_fees,
+                    table_fees,
                     "--output-dir",
                     exports_dir,
                 ],
@@ -125,11 +136,11 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
                     "--input-fees",
                     f"{exports_dir}/amm_fees",
                     "--pair",
-                    args.pair,
+                    pair,
                     "--ledger-start",
-                    str(args.ledger_start),
+                    str(ledger_start),
                     "--ledger-end",
-                    str(args.ledger_end),
+                    str(ledger_end),
                     "--output-dir",
                     model_input_dir,
                 ],
@@ -148,11 +159,11 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
                     "--root",
                     exports_dir,
                     "--pair",
-                    args.pair,
+                    pair,
                     "--ledger-start",
-                    str(args.ledger_start),
+                    str(ledger_start),
                     "--ledger-end",
-                    str(args.ledger_end),
+                    str(ledger_end),
                     "--amm-swaps",
                     f"{exports_dir}/amm_swaps",
                     "--amm-fees",
