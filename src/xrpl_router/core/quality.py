@@ -26,6 +26,16 @@ def _dbg(msg: str) -> None:
         print(msg)
 
 
+# --- New helper: SPQ as Fraction ---
+def spq_frac_from_units(x_u: int, y_u: int, keep_fee_num: int, fee_den: int) -> Fraction:
+    """Return SPQ ≈ (y/x) * (keep_fee_num/fee_den) as an exact Fraction.
+    If any inputs are non-positive, returns 0.
+    """
+    if x_u <= 0 or y_u <= 0 or keep_fee_num <= 0 or fee_den <= 0:
+        return Fraction(0, 1)
+    return Fraction(y_u * keep_fee_num, x_u * fee_den)
+
+
 def _divide_like_rippled(num: Amount, den: Amount) -> IOUAmount:
     """Compute a fixed-point IOUAmount ratio num/den using rippled-like scaling.
 
@@ -153,4 +163,5 @@ def quality_eps_for_state_frac(x_u: int, y_u: int, keep_fee_num: int, fee_den: i
 __all__ = [
     "Quality",
     "quality_eps_for_state_frac",
+    "spq_frac_from_units",
 ]

@@ -74,7 +74,7 @@ from .datatypes import (
 )
 
 # Core exceptions
-from .exc import AmountDomainError, NormalisationError, InvariantViolation
+from .exc import AmountDomainError, NormalisationError, InvariantViolation, AMMOverAsk
 
 __all__ = [
     # constants
@@ -117,4 +117,5 @@ __all__ = [
     "AmountDomainError",
     "NormalisationError",
     "InvariantViolation",
+    "AMMOverAsk",
 ]

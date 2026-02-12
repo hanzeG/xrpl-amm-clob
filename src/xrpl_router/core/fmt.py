@@ -9,7 +9,20 @@ from decimal import Decimal, getcontext, ROUND_DOWN, ROUND_UP
 from typing import Any
 
 from .exc import AmountDomainError
-from .constants import XRP_QUANTUM, IOU_QUANTUM, QUALITY_QUANTUM, DEFAULT_QUANTUM
+from .constants import XRP_QUANTUM, IOU_QUANTUM, QUALITY_QUANTUM, DEFAULT_QUANTUM, FEE_SCALE_PPB
+def fee_to_ppb(fee: Decimal, scale: int = FEE_SCALE_PPB) -> tuple[int, int, int]:
+    """Map Decimal fee in [0,1) to integer parts-per-billion.
+    Returns (fee_num, fee_den, keep_fee_num), where keep_fee_num = fee_den - fee_num.
+    Rounds down to avoid over-crediting OUT.
+    """
+    if fee < 0 or fee >= 1:
+        raise AmountDomainError("fee_to_ppb expects 0 <= fee < 1")
+    if fee == 0:
+        return 0, scale, scale
+    fee_num = int((fee * scale).to_integral_value(rounding=ROUND_DOWN))
+    fee_den = scale
+    keep_fee_num = fee_den - fee_num
+    return fee_num, fee_den, keep_fee_num
 from .amounts import XRPAmount, IOUAmount, Amount
 from .quality import Quality
 
@@ -139,4 +152,5 @@ __all__ = [
     "amount_to_decimal",
     "quality_rate_to_decimal",
     "quality_price_to_decimal",
+    "fee_to_ppb",
 ]

@@ -49,6 +49,31 @@ def _ceil_div(a: int, b: int) -> int:
         raise AmountDomainError("_ceil_div expects a>=0 and b>0")
     return 0 if a == 0 else -(-a // b)
 
+def ceil_div(a: int, b: int) -> int:
+    """Public ceil_div with non-negative domain. Returns 0 when a <= 0."""
+    if a <= 0:
+        return 0
+    if b <= 0:
+        raise AmountDomainError("ceil_div expects b>0")
+    return _ceil_div(a, b)
+
+def mul_keep_floor(value_units: int, keep_num: int, keep_den: int) -> int:
+    """Return floor(value_units * keep_num / keep_den) with non-negative guards."""
+    if value_units <= 0 or keep_num <= 0:
+        return 0
+    if keep_den <= 0:
+        raise AmountDomainError("mul_keep_floor expects keep_den>0")
+    return (value_units * keep_num) // keep_den
+
+def mul_keep_ceil(value_units: int, keep_num: int, keep_den: int) -> int:
+    """Return ceil(value_units * keep_num / keep_den) with non-negative guards."""
+    if value_units <= 0:
+        return 0
+    if keep_den <= 0:
+        raise AmountDomainError("mul_keep_ceil expects keep_den>0")
+    num = value_units * keep_num
+    return (num + keep_den - 1) // keep_den
+
 
 def _floor_div(a: int, b: int) -> int:
     if a < 0 or b <= 0:
@@ -401,4 +426,7 @@ __all__ = [
     "XRPAmount",
     "IOUAmount",
     "Amount",
+    "ceil_div",
+    "mul_keep_floor",
+    "mul_keep_ceil",
 ]

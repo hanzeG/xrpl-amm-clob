@@ -10,6 +10,7 @@ __all__ = [
     "InvariantViolation",
     "InsufficientLiquidityError",
     "InsufficientBudgetError",
+    "AMMOverAsk",
 ]
 
 
@@ -68,3 +69,15 @@ class InsufficientBudgetError(Exception):
         self.filled_out = filled_out
         self.spent_in = spent_in
         self.trace = trace
+
+
+# --- AMM over-ask exception (for non-drain net capacity) ---
+class AMMOverAsk(Exception):
+    """Raised when requested OUT exceeds AMM non-drain capacity.
+
+    Carries the maximum deliverable OUT (net) and the required IN to achieve that cap.
+    """
+    def __init__(self, max_out, dx_for_max):
+        super().__init__("AMM request exceeds capacity without draining reserves")
+        self.max_out = max_out
+        self.dx_for_max = dx_for_max

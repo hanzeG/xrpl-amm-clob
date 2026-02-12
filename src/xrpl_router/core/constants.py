@@ -10,6 +10,9 @@ helpers that rely on Decimal are moved to `fmt.py`.
 
 from decimal import Decimal
 
+# Fee scale: parts-per-billion for integer fee representation
+FEE_SCALE_PPB: int = 10**9
+
 # ---------------------------------------------------------------------------
 # STAmount (IOU) canonical ranges and XRP integer bridge
 # ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ DEFAULT_QUANTUM: Decimal = IOU_QUANTUM
 # ---------------------------------------------------------------------------
 
 __all__ = [
+    "FEE_SCALE_PPB",
     "ST_MANTISSA_DIGITS",
     "ST_MANTISSA_MIN",
     "ST_MANTISSA_MAX",

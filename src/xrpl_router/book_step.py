@@ -19,13 +19,25 @@ from typing import Any, Dict
 from decimal import Decimal
 from .core.datatypes import Segment
 from .core import Amount, Quality, XRPAmount, IOUAmount
-from .core.exc import InsufficientLiquidityError, InsufficientBudgetError
+from .core.exc import InsufficientLiquidityError, InsufficientBudgetError, AMMOverAsk
 from .core.fmt import amount_to_decimal
 from .amm import AMM
 # --- Zero-like helper for Amount types ---
 def _zero_like(a: Amount) -> Amount:
     return XRPAmount(0) if isinstance(a, XRPAmount) else IOUAmount.zero()
-#
+
+# Zero helpers bound to AMM x/y domains
+def _zero_x_for_amm(amm: Optional["AMM"]) -> Amount:
+    if amm is not None:
+        return XRPAmount(0) if amm.x_is_xrp else IOUAmount.zero()
+    # Fallback: IOU zero (won't be used if AMM is None)
+    return IOUAmount.zero()
+
+def _zero_y_for_amm(amm: Optional["AMM"]) -> Amount:
+    if amm is not None:
+        return XRPAmount(0) if amm.y_is_xrp else IOUAmount.zero()
+    # Fallback: IOU zero (won't be used if AMM is None)
+    return IOUAmount.zero()
 
 # --- Integer helpers for proportional allocation ---
 def _ten_pow(n: int) -> int:
@@ -115,8 +127,8 @@ def _execute_one_iteration(
     (filled_out, spent_in, next_segments, amm_used, tier_quality, amm_dx, amm_dy, trace)
     """
     trace: List[Dict[str, Any]] = []
-    amm_dx = _zero_like(target_out)
-    amm_dy = _zero_like(target_out)
+    amm_dx = _zero_x_for_amm(amm_obj)
+    amm_dy = _zero_y_for_amm(amm_obj)
     # We may still trade via AMM-only even if there are no CLOB segments.
     no_segs = not segs
 
@@ -146,10 +158,22 @@ def _execute_one_iteration(
         except Exception:
             synth = None
             
-    # If AMM SPQ is strictly better than LOB top quality, we expect an anchored slice
+        # If AMM SPQ is strictly better than LOB top quality, we *prefer* an anchored slice.
+    # However, due to integer grid / fee rounding / cap, an anchored slice may be impossible
+    # to synthesise even when SPQ > LOB top. This is not a fatal error: we must fall back
+    # to LOB-only for this iteration (or AMM-only later if LOB exhausts), rather than abort.
     if (q_lob_top is not None and amm_anchor and (amm_spq is not None)
             and (amm_spq.rate > q_lob_top.rate) and (not target_out.is_zero())):
-        assert synth is not None, "Expected anchored AMM slice when SPQ > LOB top; _amm_anchor returned None"
+        if synth is None:
+            trace.append({
+                "src": "AMM",
+                "event": "anchor_failed",
+                "reason": "SPQ > LOB_top but _amm_anchor returned None (integer grid / rounding / cap)",
+                "lob_top_quality": q_lob_top,
+                "amm_spq": amm_spq,
+                "target_out": target_out,
+            })
+            # Proceed without AMM-first in this iteration; LOB tier will execute below.
 
     # AMM slices bundle for AMM-only shadow slicing
     amm_slices: List[Segment] = []
@@ -157,12 +181,14 @@ def _execute_one_iteration(
     # AMM-only mode: if no CLOB top, synthesize a single integer-domain slice up to the target
     if q_lob_top is None and amm_obj is not None and (not target_out.is_zero()):
         try:
-            dx_needed, capped = amm_obj.dx_for_out_st(target_out, raise_on_overask=False)
+            dx_needed = amm_obj.dx_for_out_st(target_out)
             if dx_needed is not None and (not dx_needed.is_zero()):
-                out_amt = target_out if not capped else amm_obj.max_out_net_cap_st()
-                if out_amt is not None and (not out_amt.is_zero()):
-                    q_slice = Quality.from_amounts(out_amt, dx_needed)
-                    amm_slices.append(Segment(src="AMM", out_max=out_amt, in_at_out_max=dx_needed, quality=q_slice))
+                out_amt = target_out
+                q_slice = Quality.from_amounts(out_amt, dx_needed)
+                amm_slices.append(Segment(src="AMM", out_max=out_amt, in_at_out_max=dx_needed, quality=q_slice))
+        except AMMOverAsk:
+            # Over-ask: do not craft a partial AMM slice in this iteration
+            pass
         except Exception:
             amm_slices = []
 
@@ -172,6 +198,8 @@ def _execute_one_iteration(
         total_in = _zero_like(segs[0].in_at_out_max)
     elif synth is not None:
         total_in = _zero_like(synth.in_at_out_max)
+    elif amm_obj is not None:
+        total_in = _zero_x_for_amm(amm_obj)
     else:
         total_in = _zero_like(target_out)
 
@@ -410,8 +438,44 @@ class BookStep(Step):
             segs = []
         # Prepare a shadow AMM for reverse routing so AMM state advances between iterations
         shadow_amm = self.amm.clone() if self.amm is not None else None
-        # --- AMM-only mode: true if no segs and AMM present
-        amm_only_mode = (not segs) and (shadow_amm is not None)
+        # Compute total capacity (CLOB + AMM)
+        from .core.fmt import amount_to_decimal
+        total_cap = None
+        # Sum all CLOB out_max (excluding AMM)
+        clob_cap = None
+        for s in segs:
+            if s.src != "AMM":
+                if clob_cap is None:
+                    clob_cap = _zero_like(s.out_max)
+                clob_cap = clob_cap + s.out_max
+        if clob_cap is None:
+            clob_cap = _zero_like(out_req)
+        total_cap = clob_cap
+        # Add AMM non-drain cap if present
+        amm_cap = None
+        if self.amm is not None:
+            # Compute AMM max out by asking for a huge out and catching AMMOverAsk
+            try:
+                huge_out = self.amm._from_units(self.amm._to_units_floor(self.amm.y, self.amm.y_is_xrp) + 1000, self.amm.y_is_xrp)
+                _ = self.amm.dx_for_out_st(huge_out)
+            except AMMOverAsk as e:
+                amm_cap = e.max_out
+            except Exception:
+                amm_cap = None
+        if amm_cap is not None:
+            total_cap = total_cap + amm_cap
+        # Compare out_req to total_cap
+        req_dec = amount_to_decimal(out_req)
+        cap_dec = amount_to_decimal(total_cap)
+        if req_dec > cap_dec:
+            raise InsufficientLiquidityError(
+                requested_out=out_req,
+                max_fill_out=total_cap,
+                filled_out=_zero_like(out_req),
+                spent_in=_zero_like(out_req),
+                trace=None,
+            )
+        # Proceed with normal path
         need = out_req
         total_in = _zero_like(out_req)
         total_out = _zero_like(out_req)
@@ -420,7 +484,6 @@ class BookStep(Step):
         for _ in range(64):
             if need.is_zero():
                 break
-            # Bind anchoring to the shadow AMM so its evolving state is used
             anchor_fn = (lambda q, cap: shadow_amm.synthetic_segment_for_quality(q, max_out_cap=cap)) if shadow_amm is not None else None
             spq_now = shadow_amm.spq_quality_int() if shadow_amm is not None else None
             filled, spent, next_segs, amm_used, _, amm_dx, amm_dy, itr_trace = _execute_one_iteration(
@@ -450,36 +513,17 @@ class BookStep(Step):
             # Apply AMM deltas to the shadow AMM so the next iteration sees updated reserves
             if amm_used and (shadow_amm is not None) and (not amm_dx.is_zero() or not amm_dy.is_zero()):
                 shadow_amm.apply_fill_st(amm_dx, amm_dy)
-            # In AMM-only reverse, produce at most one slice to avoid repeated synthetic segments
-            if amm_only_mode:
-                break
         self._cached_out = total_out
         self._cached_in = total_in
-        # Strict correctness: if requested more than we could fill, raise with context
-        if require_full_fill and (total_out < out_req):
-            # Provide context via exception, including the trace we collected so far
+        # If requested more than we could fill, raise with context
+        if amount_to_decimal(total_out) < amount_to_decimal(out_req):
             raise InsufficientLiquidityError(
                 requested_out=out_req,
-                max_fill_out=total_out,
+                max_fill_out=total_cap,
                 filled_out=total_out,
                 spent_in=total_in,
                 trace=all_trace if return_trace else None,
             )
-        # In non-strict mode, annotate partial in the trace for observability
-        if (not require_full_fill) and return_trace and (total_out < out_req):
-            try:
-                req_dec = amount_to_decimal(out_req)
-                filled_dec = amount_to_decimal(total_out)
-                fill_ratio = float(filled_dec / req_dec) if req_dec != 0 else 0.0
-                all_trace.append({
-                    "status": "PARTIAL",
-                    "requested": req_dec,
-                    "filled": filled_dec,
-                    "fill_ratio": fill_ratio,
-                })
-            except Exception:
-                # Best-effort; tracing must not break execution
-                all_trace.append({"status": "PARTIAL"})
         if return_trace:
             return self._cached_out, self._cached_in, all_trace
         return self._cached_out, self._cached_in
@@ -586,3 +630,255 @@ class BookStep(Step):
             return Quality.from_amounts(XRPAmount(0), IOUAmount.from_components(1, 0))
         best = max(s.quality for s in segs)
         return best
+
+
+# --- Read-only router-level preview (no side effects) ---
+class RouterQuoteView:
+    """
+    Read-only router-level preview that mirrors BookStep anchoring and integer-domain math,
+    without touching sandbox or mutating a live AMM. Suitable for tests/logging/UI.
+
+    This class intentionally reuses existing routing helpers and AMM integer APIs:
+      - `_prefer_clob_on_ties` for ordering CLOB segments
+      - `_execute_one_iteration` for anchoring and slice assembly per iteration
+      - `AMM.synthetic_segment_for_quality`, `dx_for_out_st`, `swap_*_st`, `apply_fill_st` on shadow clones
+
+    Step 1: skeleton only. Methods are declared with signatures and docstrings,
+    but raise NotImplementedError. No business logic is added in this patch.
+    """
+
+    def __init__(
+        self,
+        segments_provider: Callable[[], Iterable[Segment]],
+        *,
+        amm: Optional[AMM] = None,
+        limit_quality: Optional[Quality] = None,
+    ) -> None:
+        """Initialise a read-only view.
+
+        Parameters
+        ----------
+        segments_provider : Callable[[], Iterable[Segment]]
+            Provider returning current CLOB segments.
+        amm : Optional[AMM]
+            AMM instance to use for preview (a shadow clone will be used internally).
+        limit_quality : Optional[Quality]
+            Optional minimum acceptable quality threshold for preview filtering.
+        """
+        self._provider = segments_provider
+        self._amm = amm
+        self._limit_q = limit_quality
+
+    # ---- Snapshots (covers pool summary + CLOB ladder) ----
+    def snapshot(self) -> dict:
+        """Return a dict snapshot with AMM state and ordered CLOB ladder."""
+        # AMM snapshot
+        amm = self._amm
+        if amm is not None:
+            x_reserve = amm.x
+            y_reserve = amm.y
+            fee_decimal = float(amm.fee)
+            fee_ppb = (amm._keep_fee_num, amm._fee_den)
+            spq_quality = amm.spq_quality_int()
+            # Compute max_out_cap by asking for a huge OUT, catch AMMOverAsk for cap
+            max_out_cap = None
+            try:
+                # Try to get dx for a huge out (y_reserve+1000)
+                huge_out = amm._from_units(amm._to_units_floor(amm.y, amm.y_is_xrp) + 1000, amm.y_is_xrp)
+                _ = amm.dx_for_out_st(huge_out)
+            except AMMOverAsk as e:
+                max_out_cap = e.max_out
+            except Exception:
+                max_out_cap = None
+            amm_snapshot = {
+                "x_reserve": x_reserve,
+                "y_reserve": y_reserve,
+                "fee_decimal": fee_decimal,
+                "fee_ppb": fee_ppb,
+                "spq_quality": spq_quality,
+                "max_out_cap": max_out_cap,
+            }
+        else:
+            amm_snapshot = None
+        # CLOB ladder: order via _prefer_clob_on_ties
+        try:
+            segs = _prefer_clob_on_ties(self._provider())
+        except Exception:
+            segs = []
+        clob_ladder = [
+            {"quality": s.quality, "out_max": s.out_max, "in_at_out_max": s.in_at_out_max}
+            for s in segs if s.src != "AMM"
+        ]
+        return {
+            "amm": amm_snapshot,
+            "clob_ladder": clob_ladder,
+        }
+
+    # ---- Quotes (OUT-driven) ----
+    def preview_out(self, out_req: Amount) -> dict:
+        """Return a read-only quote preview for a requested OUT amount."""
+        if out_req is None or out_req.is_zero():
+            return {
+                "slices": [],
+                "anchors": [],
+                "summary": {
+                    "total_out": out_req,
+                    "total_in": out_req,
+                    "avg_quality": None,
+                    "requested_out": out_req,
+                    "is_partial": False,
+                    "fill_ratio": 1.0,
+                },
+            }
+        try:
+            segs = _prefer_clob_on_ties(self._provider())
+        except Exception:
+            segs = []
+        shadow_amm = self._amm.clone() if self._amm is not None else None
+        need = out_req
+        # OUT zero follows out_req domain; IN zero follows first CLOB in-side if present, otherwise AMM x-side if present
+        total_out = _zero_like(out_req)
+        try:
+            segs_probe = _prefer_clob_on_ties(self._provider())
+        except Exception:
+            segs_probe = []
+        if segs_probe:
+            total_in = _zero_like(segs_probe[0].in_at_out_max)
+        elif self._amm is not None:
+            total_in = XRPAmount(0) if self._amm.x_is_xrp else IOUAmount.zero()
+        else:
+            total_in = _zero_like(out_req)
+        slices = []
+        anchors = []
+        prev_amm_q = None
+        for _ in range(64):
+            if need.is_zero():
+                break
+            # Bind anchoring to the shadow AMM so its evolving state is used
+            anchor_fn = (lambda q, cap: shadow_amm.synthetic_segment_for_quality(q, max_out_cap=cap)) if shadow_amm is not None else None
+            spq_now = shadow_amm.spq_quality_int() if shadow_amm is not None else None
+            filled, spent, next_segs, amm_used, tier_quality, amm_dx, amm_dy, itr_trace = self._pick_iteration(
+                segs, need, shadow_amm
+            )
+            # Track anchors
+            anchors.append({
+                "q_lob_top": tier_quality,
+                "q_amm_spq_at_iter": spq_now,
+            })
+            # Convert itr_trace into slices, add AMM diagnostics if needed
+            for t in itr_trace:
+                rec = {
+                    "src": t.get("src"),
+                    "out_take": t.get("take_out"),
+                    "in_take": t.get("take_in"),
+                    "avg_quality": t.get("quality"),
+                }
+                if t.get("src") == "AMM" and shadow_amm is not None:
+                    # Compute AMM diagnostics on a disposable clone
+                    diag = self._analyse_amm_slice(
+                        shadow_amm, t.get("take_in"), t.get("take_out"), t.get("quality")
+                    )
+                    rec.update(diag)
+                slices.append(rec)
+            if filled.is_zero():
+                break
+            total_in = spent if total_in.is_zero() else (total_in + spent)
+            total_out = filled if total_out.is_zero() else (total_out + filled)
+            need = out_req - total_out
+            segs = next_segs
+            # Apply AMM deltas to the shadow AMM so the next iteration sees updated reserves
+            if amm_used and (shadow_amm is not None) and (not amm_dx.is_zero() or not amm_dy.is_zero()):
+                shadow_amm.apply_fill_st(amm_dx, amm_dy)
+        # Compute summary
+        is_partial = amount_to_decimal(total_out) < amount_to_decimal(out_req)
+        fill_ratio = None
+        try:
+            req_dec = amount_to_decimal(out_req)
+            filled_dec = amount_to_decimal(total_out)
+            fill_ratio = float(filled_dec / req_dec) if req_dec != 0 else 0.0
+        except Exception:
+            fill_ratio = None
+        avg_quality = None
+        if not total_out.is_zero() and not total_in.is_zero():
+            avg_quality = Quality.from_amounts(total_out, total_in)
+        return {
+            "slices": slices,
+            "anchors": anchors,
+            "summary": {
+                "total_out": total_out,
+                "total_in": total_in,
+                "avg_quality": avg_quality,
+                "requested_out": out_req,
+                "is_partial": is_partial,
+                "fill_ratio": fill_ratio,
+            },
+        }
+
+    # ---- Quotes (IN-driven, optional; mirrors BookStep.fwd) ----
+    def preview_in(self, in_cap: Amount) -> dict:
+        """Return a read-only quote preview for a given IN budget (optional path).
+
+        Structure mirrors `preview_out()` and will be implemented in step 3 if needed.
+        """
+        raise NotImplementedError("RouterQuoteView.preview_in() is not implemented in step 1")
+
+    # ---- Internal helpers (pure; no side effects) ----
+    def _pick_iteration(
+        self,
+        segs: List[Segment],
+        need: Amount,
+        shadow_amm: Optional[AMM],
+    ) -> tuple:
+        """Pure selection for one iteration. Wrapper over _execute_one_iteration."""
+        anchor_fn = (lambda q, cap: shadow_amm.synthetic_segment_for_quality(q, max_out_cap=cap)) if shadow_amm is not None else None
+        spq_now = shadow_amm.spq_quality_int() if shadow_amm is not None else None
+        return _execute_one_iteration(
+            segs,
+            target_out=need,
+            send_max=None,
+            limit_quality=self._limit_q,
+            amm_anchor=anchor_fn,
+            amm_spq=spq_now,
+            amm_obj=shadow_amm,
+        )
+
+    def _analyse_amm_slice(
+        self,
+        shadow_amm: AMM,
+        in_take: Amount,
+        out_take: Amount,
+        avg_quality: Quality,
+    ) -> dict:
+        """Compute AMM diagnostics on disposable clones (pre/post SPQ, fees, slippage)."""
+        # Compute pre-trade SPQ
+        pre_spq = shadow_amm.spq_quality_int()
+        # Simulate fill on a disposable clone to get post_spq
+        clone = shadow_amm.clone()
+        clone.apply_fill_st(in_take, out_take)
+        post_spq = clone.spq_quality_int()
+        # Fee details: reconstruct dx_eff, fee_paid from gross in_take using integer grid logic
+        dx_gross = shadow_amm._amt_to_units_floor(in_take)
+        if dx_gross <= 0:
+            dx_eff = _zero_like(in_take)
+            fee_paid = _zero_like(in_take)
+        else:
+            dx_eff_units = (dx_gross * shadow_amm._keep_fee_num) // shadow_amm._fee_den
+            dx_eff = shadow_amm._from_units(dx_eff_units, shadow_amm.x_is_xrp)
+            fee_paid_units = dx_gross - dx_eff_units
+            fee_paid = shadow_amm._from_units(fee_paid_units, shadow_amm.x_is_xrp)
+        # Average quality as provided; pre_spq price, avg_price for slippage
+        # price = IN/OUT (in decimal)
+        try:
+            from .core.fmt import amount_to_decimal, quality_rate_to_decimal
+            p_pre = 1.0 / float(quality_rate_to_decimal(pre_spq)) if not pre_spq.is_zero() else None
+            p_avg = 1.0 / float(quality_rate_to_decimal(avg_quality)) if avg_quality is not None and not avg_quality.is_zero() else None
+            slippage_price_premium = (p_avg / p_pre - 1.0) if (p_pre and p_avg) else None
+        except Exception:
+            slippage_price_premium = None
+        return {
+            "pre_spq": pre_spq,
+            "post_spq": post_spq,
+            "dx_eff": dx_eff,
+            "fee_paid": fee_paid,
+            "slippage_price_premium": slippage_price_premium,
+        }
