@@ -42,3 +42,10 @@ pip-wheel-metadata/
 
 # Python version managers
 .python-version
+
+# Phase-1 repository zoning
+artifacts/*
+!artifacts/.gitkeep
+!artifacts/README.md
+data/output/
+data/output_csv/

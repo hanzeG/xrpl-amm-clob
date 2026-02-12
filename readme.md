@@ -2,6 +2,15 @@
 
 This repository provides a modelling and simulation toolkit to study **execution efficiency** on XRPL across AMM and CLOB venues. It centralises Decimal policy (precision, quantum, rounding) so AMM, CLOB and the router share identical arithmetic.
 
+## Repository Zones (Phase 1)
+- `src/xrpl_router/`: model implementation
+- `empirical/`: empirical/data workflow zone
+- `apps/`: stable launchers for scripts
+- `tests/`: automated checks
+- `artifacts/`: generated outputs (git-ignored)
+
+Architecture notes: `docs/ARCHITECTURE.md`
+
 ## Whitepaper alignment (cross‑reference)
 - **Reverse → Forward with limiting‑step replay** — §1.3.2. The router performs a reverse dry‑run (no write‑backs) to find required inputs and the limiting step, then forward replays with state application.
 - **Multi‑path AMM behaviour (Fibonacci slicing & bounded iterations)** — §1.2.7.3. Per‑iteration AMM OUT is capped (Fibonacci growth from a base), and AMM participation is bounded in count.
@@ -71,6 +80,15 @@ Then run the test suite:
 
 ```bash
 pytest
+```
+
+Run stable launchers:
+
+```bash
+python apps/run_model.py amm-only
+python apps/run_model.py hybrid-one-tx
+python apps/run_empirical.py check-freshness
+python apps/run_empirical.py test-share-profile
 ```
 
 Configuration for linting, type checks, and formatting is in `pyproject.toml`.
