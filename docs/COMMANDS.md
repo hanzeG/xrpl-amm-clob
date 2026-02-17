@@ -37,6 +37,7 @@ python apps/run_empirical.py empirical-compare-single -- --help
 python apps/run_empirical.py empirical-analyze-traces -- --help
 python apps/run_empirical.py empirical-enrich-clob-with-tx-index -- --help
 python apps/run_empirical.py empirical-check-parquet-bounds -- --help
+python apps/run_empirical.py empirical-reconstruct-real-paths -- --help
 ```
 
 Use a custom Delta Sharing profile path:

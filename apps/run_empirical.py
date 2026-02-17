@@ -24,6 +24,7 @@ SCRIPT_MAP = {
     "empirical-analyze-traces": "empirical/scripts/empirical_analyze_traces.py",
     "empirical-enrich-clob-with-tx-index": "empirical/scripts/empirical_enrich_clob_with_tx_index.py",
     "empirical-check-parquet-bounds": "empirical/scripts/empirical_check_parquet_bounds.py",
+    "empirical-reconstruct-real-paths": "empirical/scripts/empirical_reconstruct_real_paths.py",
 }
 
 LEGACY_ALIAS_MAP = {

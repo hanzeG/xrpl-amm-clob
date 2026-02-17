@@ -8,6 +8,7 @@
 - `empirical_analyze_traces.py`
 - `empirical_enrich_clob_with_tx_index.py`
 - `empirical_check_parquet_bounds.py`
+- `empirical_reconstruct_real_paths.py`
 - `delta_sharing_check_freshness.py`
 - `delta_sharing_test_profile.py`
 - `empirical_download_clob_offers_range.py`
