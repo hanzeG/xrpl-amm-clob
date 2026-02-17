@@ -236,7 +236,15 @@ def _execute_one_iteration(
                 total_in = total_in + in_amm
                 amm_dx = amm_dx + in_amm
                 amm_dy = amm_dy + out_take_amm
-                trace.append({"src": "AMM", "take_out": out_take_amm, "take_in": in_amm, "quality": synth.quality})
+                trace.append(
+                    {
+                        "src": "AMM",
+                        "source_id": synth.source_id,
+                        "take_out": out_take_amm,
+                        "take_in": in_amm,
+                        "quality": synth.quality,
+                    }
+                )
                 target_out = target_out - out_take_amm
         # AMM-only bundle (shadow-sliced): consume slices in order
         else:
@@ -250,7 +258,15 @@ def _execute_one_iteration(
                 total_in = total_in + in_amm
                 amm_dx = amm_dx + in_amm
                 amm_dy = amm_dy + out_take_amm
-                trace.append({"src": "AMM", "take_out": out_take_amm, "take_in": in_amm, "quality": seg.quality})
+                trace.append(
+                    {
+                        "src": "AMM",
+                        "source_id": seg.source_id,
+                        "take_out": out_take_amm,
+                        "take_in": in_amm,
+                        "quality": seg.quality,
+                    }
+                )
                 target_out = target_out - out_take_amm
 
     # ----------------------
@@ -329,7 +345,15 @@ def _execute_one_iteration(
                 # Accumulate fills
                 total_out = total_out + out_take
                 total_in = total_in + in_amt
-                trace.append({"src": s.src, "take_out": out_take, "take_in": in_amt, "quality": s.quality})
+                trace.append(
+                    {
+                        "src": s.src,
+                        "source_id": s.source_id,
+                        "take_out": out_take,
+                        "take_in": in_amt,
+                        "quality": s.quality,
+                    }
+                )
 
                 # Update remaining target and budget
                 remaining_target = remaining_target - out_take
@@ -340,7 +364,16 @@ def _execute_one_iteration(
                 rem_out = s.out_max - out_take
                 rem_in = s.in_at_out_max - in_amt
                 if (not rem_out.is_zero()) and (not rem_in.is_zero()):
-                    next_segs.append(Segment(src=s.src, out_max=rem_out, in_at_out_max=rem_in, quality=s.quality))
+                    next_segs.append(
+                        Segment(
+                            src=s.src,
+                            out_max=rem_out,
+                            in_at_out_max=rem_in,
+                            quality=s.quality,
+                            raw_quality=s.raw_quality,
+                            source_id=s.source_id,
+                        )
+                    )
 
                 # Stop if target satisfied or budget exhausted
                 if remaining_target.is_zero() or (budget_left is not None and budget_left.is_zero()):
@@ -769,6 +802,7 @@ class RouterQuoteView:
             for t in itr_trace:
                 rec = {
                     "src": t.get("src"),
+                    "source_id": t.get("source_id"),
                     "out_take": t.get("take_out"),
                     "in_take": t.get("take_in"),
                     "avg_quality": t.get("quality"),
