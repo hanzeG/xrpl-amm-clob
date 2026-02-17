@@ -20,10 +20,30 @@ or open the same file in VSCode Notebook.
 4. In the notebook config cell, set `TARGET_TX_HASH`.
 5. Restart kernel, then **Run All**.
 
-### Outputs
-- Real trajectory table (metadata order + DS-filled amounts, pair-scoped rows)
-- Model trajectory table (single-path replay; AMM slices collapsed to one row)
-- Key compare lines (`in` gap %, AMM input share compare, offer-id overlap)
+### Example Output (Current Single-Tx Demo)
+Tx:
+`6AA281DD3ED17153F5149EE82965563D8B44BAB69226717EAD4E68326CF96A64`
+
+Real trajectory table (excerpt):
+
+| segment_no | segment_kind | node_type | clob_offer_id | out_take | in_take | avg_quality |
+|---:|---|---|---|---:|---:|---:|
+| 1 | CLOB | DeletedNode | 27CC | 1910.999520 | 983.818990 | 1.942429999 |
+| 2 | CLOB | DeletedNode | AE48 | 38.828862 | 20.000000 | 1.941443123 |
+| 3 | CLOB | DeletedNode | 655A | 9.883000 | 5.091257 | 1.941170913 |
+| 12 | AMM | ModifiedNode | None | 1020.051024 | 526.257185 | 1.938312773 |
+
+Model trajectory table (excerpt):
+
+| segment_no | segment_kind | node_type | clob_offer_id | out_take | in_take | avg_quality |
+|---:|---|---|---|---:|---:|---:|
+| 1 | CLOB | DeletedNode(model) | 27CC | 1910.999520 | 983.818991 | 1.942429997 |
+| 2 | CLOB | DeletedNode(model) | AE48 | 38.828862 | 20.000000 | 1.941443123 |
+| 3 | CLOB | DeletedNode(model) | 655A | 9.883000 | 5.091257 | 1.941170913 |
+| 12 | AMM | ModifiedNode(model-AMM) | None | 1020.051025 | 526.257186 | 1.938312772 |
+
+The notebook prints the full two tables for the selected tx.
+Use them directly to compare real execution trajectory vs single-path model trajectory.
 
 ## Structure
 - `src/xrpl_router/`: routing core and math
