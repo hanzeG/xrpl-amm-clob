@@ -163,6 +163,14 @@ def is_xrp(cur: str) -> bool:
     return cur == XRP
 
 
+def is_target_pair(cur_a: str, cur_b: str) -> bool:
+    """True only when currencies are exactly the configured rUSD/XRP pair (either side)."""
+    return (
+        (cur_a == RUSD_HEX and cur_b == XRP)
+        or (cur_a == XRP and cur_b == RUSD_HEX)
+    )
+
+
 def direction_label(in_cur: str, out_cur: str) -> str:
     return f"{pretty_cur(in_cur)}->{pretty_cur(out_cur)}"
 
@@ -466,8 +474,9 @@ def presence_signature(uses_amm: bool, uses_clob: bool) -> str:
 
 
 def real_presence_signature(n_legs: int) -> str:
-    # From your dataset definition, REAL total_out always includes AMM_out and CLOB legs_out.
-    # So REAL always uses AMM; CLOB is used iff legs>0.
+    # Pair-scoped convention:
+    # REAL always uses AMM (tx list comes from AMM swaps), and CLOB is used iff
+    # rUSD/XRP CLOB legs exist for this tx.
     return presence_signature(uses_amm=True, uses_clob=(n_legs > 0))
 
 
@@ -631,9 +640,14 @@ def main() -> None:
         h = r["transaction_hash"]
         if h is None:
             continue
+        base_cur = str(r["base_currency"])
+        counter_cur = str(r["counter_currency"])
+        # Pair-scoped REAL path: only count CLOB legs that are truly in rUSD/XRP.
+        if not is_target_pair(base_cur, counter_cur):
+            continue
         legs_map.setdefault(str(h), []).append({
-            "base_currency": r["base_currency"],
-            "counter_currency": r["counter_currency"],
+            "base_currency": base_cur,
+            "counter_currency": counter_cur,
             "base_amount": r["base_amount"],
             "counter_amount": r["counter_amount"],
         })
