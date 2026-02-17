@@ -25,7 +25,7 @@ def test_pipeline_run_dry_run() -> None:
     result = subprocess.run(cmd, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "[dry-run] planned pipeline steps:" in result.stdout
-    assert "pipeline_export_window.py" in result.stdout
-    assert "pipeline_build_model_input.py" in result.stdout
-    assert "research_compare_rolling.py" in result.stdout
+    assert "empirical_export_window.py" in result.stdout
+    assert "empirical_build_model_input.py" in result.stdout
+    assert "empirical_compare_rolling.py" in result.stdout
 

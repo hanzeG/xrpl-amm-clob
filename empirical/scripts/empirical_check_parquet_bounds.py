@@ -12,7 +12,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    spark = SparkSession.builder.appName("research_check_parquet_bounds").getOrCreate()
+    spark = SparkSession.builder.appName("empirical_check_parquet_bounds").getOrCreate()
     df = spark.read.parquet(args.path)
 
     df.agg(

@@ -27,14 +27,21 @@ python apps/run_empirical.py pipeline-run -- \
 
 ## Empirical Script Aliases
 ```bash
-python apps/run_empirical.py check-freshness
-python apps/run_empirical.py test-share-profile
-python apps/run_empirical.py download-clob-offers-range -- --help
-python apps/run_empirical.py pipeline-export-window -- --help
-python apps/run_empirical.py pipeline-build-model-input -- --help
-python apps/run_empirical.py research-compare-rolling -- --help
-python apps/run_empirical.py research-compare-single -- --help
-python apps/run_empirical.py research-analyse-traces -- --help
-python apps/run_empirical.py research-enrich-clob -- --help
-python apps/run_empirical.py research-check-parquet -- --help
+python apps/run_empirical.py delta-sharing-check-freshness
+python apps/run_empirical.py delta-sharing-test-profile
+python apps/run_empirical.py empirical-download-clob-offers-range -- --help
+python apps/run_empirical.py empirical-export-window -- --help
+python apps/run_empirical.py empirical-build-model-input -- --help
+python apps/run_empirical.py empirical-compare-rolling -- --help
+python apps/run_empirical.py empirical-compare-single -- --help
+python apps/run_empirical.py empirical-analyze-traces -- --help
+python apps/run_empirical.py empirical-enrich-clob-with-tx-index -- --help
+python apps/run_empirical.py empirical-check-parquet-bounds -- --help
 ```
+
+Use a custom Delta Sharing profile path:
+```bash
+XRPL_SHARE_PROFILE=/absolute/path/to/config.share python apps/run_empirical.py delta-sharing-test-profile
+```
+
+Legacy aliases remain supported with a compatibility info message.

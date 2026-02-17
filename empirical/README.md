@@ -1,16 +1,16 @@
 # Empirical Workflows
 
 ## Active Scripts
-- `pipeline_export_window.py`
-- `pipeline_build_model_input.py`
-- `research_compare_rolling.py`
-- `research_compare_single.py`
-- `research_analyse_traces.py`
-- `research_enrich_clob_with_tx_index.py`
-- `research_check_parquet_bounds.py`
-- `check_delta_sharing_freshness.py`
-- `test_delta_sharing_profile.py`
-- `download_clob_offers_range.py`
+- `empirical_export_window.py`
+- `empirical_build_model_input.py`
+- `empirical_compare_rolling.py`
+- `empirical_compare_single.py`
+- `empirical_analyze_traces.py`
+- `empirical_enrich_clob_with_tx_index.py`
+- `empirical_check_parquet_bounds.py`
+- `delta_sharing_check_freshness.py`
+- `delta_sharing_test_profile.py`
+- `empirical_download_clob_offers_range.py`
 
 ## Recommended Pipeline
 ```bash
@@ -26,3 +26,5 @@ Command reference: `docs/COMMANDS.md`
 ## Credentials
 - Local token: `data/config.share`
 - Template: `data/config.share.example`
+- Optional override: `XRPL_SHARE_PROFILE=/absolute/path/to/config.share`
+- Recommended local permission: `chmod 600 data/config.share`

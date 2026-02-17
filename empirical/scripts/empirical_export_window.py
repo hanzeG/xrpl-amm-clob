@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pyspark.sql import SparkSession, functions as F
 
@@ -21,7 +23,11 @@ def parse_args() -> argparse.Namespace:
             "(ledger/date/time) and pair selection."
         )
     )
-    p.add_argument("--share-profile", default="data/config.share", help="Delta Sharing profile path")
+    p.add_argument(
+        "--share-profile",
+        default=os.environ.get("XRPL_SHARE_PROFILE", "data/config.share"),
+        help="Delta Sharing profile path",
+    )
     p.add_argument("--share", default="ripple-ubri-share", help="Delta Sharing share name")
     p.add_argument("--schema", default="ripplex", help="Delta Sharing schema name")
     p.add_argument("--table-amm", default="fact_amm_swaps", help="AMM swaps table")
@@ -97,14 +103,47 @@ def write_manifest(path: str, payload: dict) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def validate_share_profile(profile: str) -> None:
+    profile_path = Path(profile)
+    if not profile_path.exists():
+        raise SystemExit(
+            f"share profile not found: {profile_path}. "
+            "Provide --share-profile or set XRPL_SHARE_PROFILE."
+        )
+
+    try:
+        payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"share profile is not valid JSON: {profile_path} ({exc})")
+
+    exp_raw = payload.get("expirationTime")
+    if exp_raw:
+        try:
+            exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+        except Exception:
+            raise SystemExit(f"share profile has unparseable expirationTime: {exp_raw}")
+        if exp <= datetime.now(timezone.utc):
+            raise SystemExit(
+                f"share profile is expired at {exp.isoformat()} (UTC): {profile_path}"
+            )
+
+    mode = stat.S_IMODE(profile_path.stat().st_mode)
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(
+            f"[warn] {profile_path} is group/other-readable "
+            f"(mode {oct(mode)}). Recommended: chmod 600 {profile_path}"
+        )
+
+
 def main() -> None:
     args = parse_args()
     if args.ledger_start is not None and args.ledger_end is not None and args.ledger_end < args.ledger_start:
         raise SystemExit("--ledger-end must be >= --ledger-start")
+    validate_share_profile(args.share_profile)
 
     out_root = default_output_dir(args)
 
-    spark = SparkSession.builder.appName("pipeline_export_window").getOrCreate()
+    spark = SparkSession.builder.appName("empirical_export_window").getOrCreate()
 
     # AMM swaps
     if not args.skip_amm:
@@ -224,7 +263,7 @@ def main() -> None:
 
     spark.stop()
     manifest = {
-        "script": "pipeline_export_window.py",
+        "script": "empirical_export_window.py",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "pair": args.pair,
         "filters": {

@@ -6,21 +6,37 @@ from __future__ import annotations
 import argparse
 import json
 import runpy
+import stat
 import sys
+from datetime import datetime, timezone
+import os
 from pathlib import Path
 
 
 SCRIPT_MAP = {
-    "check-freshness": "empirical/scripts/check_delta_sharing_freshness.py",
-    "download-clob-offers-range": "empirical/scripts/download_clob_offers_range.py",
-    "test-share-profile": "empirical/scripts/test_delta_sharing_profile.py",
-    "research-compare-rolling": "empirical/scripts/research_compare_rolling.py",
-    "research-compare-single": "empirical/scripts/research_compare_single.py",
-    "research-analyse-traces": "empirical/scripts/research_analyse_traces.py",
-    "research-enrich-clob": "empirical/scripts/research_enrich_clob_with_tx_index.py",
-    "research-check-parquet": "empirical/scripts/research_check_parquet_bounds.py",
-    "pipeline-export-window": "empirical/scripts/pipeline_export_window.py",
-    "pipeline-build-model-input": "empirical/scripts/pipeline_build_model_input.py",
+    "delta-sharing-check-freshness": "empirical/scripts/delta_sharing_check_freshness.py",
+    "delta-sharing-test-profile": "empirical/scripts/delta_sharing_test_profile.py",
+    "empirical-download-clob-offers-range": "empirical/scripts/empirical_download_clob_offers_range.py",
+    "empirical-export-window": "empirical/scripts/empirical_export_window.py",
+    "empirical-build-model-input": "empirical/scripts/empirical_build_model_input.py",
+    "empirical-compare-rolling": "empirical/scripts/empirical_compare_rolling.py",
+    "empirical-compare-single": "empirical/scripts/empirical_compare_single.py",
+    "empirical-analyze-traces": "empirical/scripts/empirical_analyze_traces.py",
+    "empirical-enrich-clob-with-tx-index": "empirical/scripts/empirical_enrich_clob_with_tx_index.py",
+    "empirical-check-parquet-bounds": "empirical/scripts/empirical_check_parquet_bounds.py",
+}
+
+LEGACY_ALIAS_MAP = {
+    "check-freshness": "delta-sharing-check-freshness",
+    "test-share-profile": "delta-sharing-test-profile",
+    "download-clob-offers-range": "empirical-download-clob-offers-range",
+    "pipeline-export-window": "empirical-export-window",
+    "pipeline-build-model-input": "empirical-build-model-input",
+    "research-compare-rolling": "empirical-compare-rolling",
+    "research-compare-single": "empirical-compare-single",
+    "research-analyse-traces": "empirical-analyze-traces",
+    "research-enrich-clob": "empirical-enrich-clob-with-tx-index",
+    "research-check-parquet": "empirical-check-parquet-bounds",
 }
 
 
@@ -67,6 +83,37 @@ def _parse_pipeline_args(raw: list[str]) -> argparse.Namespace:
     return p.parse_args(_strip_double_dash(raw))
 
 
+def _validate_share_profile(profile_path: Path) -> None:
+    if not profile_path.exists():
+        raise SystemExit(
+            f"share profile not found: {profile_path}. "
+            "Provide --share-profile or set XRPL_SHARE_PROFILE."
+        )
+
+    try:
+        payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise SystemExit(f"share profile is not valid JSON: {profile_path} ({exc})")
+
+    exp_raw = payload.get("expirationTime")
+    if exp_raw:
+        try:
+            exp = datetime.fromisoformat(exp_raw.replace("Z", "+00:00"))
+        except Exception:
+            raise SystemExit(f"share profile has unparseable expirationTime: {exp_raw}")
+        if exp <= datetime.now(timezone.utc):
+            raise SystemExit(
+                f"share profile is expired at {exp.isoformat()} (UTC): {profile_path}"
+            )
+
+    mode = stat.S_IMODE(profile_path.stat().st_mode)
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(
+            f"[warn] {profile_path} is group/other-readable "
+            f"(mode {oct(mode)}). Recommended: chmod 600 {profile_path}"
+        )
+
+
 def _run_pipeline(root: Path, raw_args: list[str]) -> int:
     args = _parse_pipeline_args(raw_args)
     cfg_path = root / args.config
@@ -80,7 +127,11 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
     ledger_end = args.ledger_end if args.ledger_end is not None else cfg_data.get("ledger_end")
     if ledger_start is None or ledger_end is None:
         raise SystemExit("pipeline-run requires --ledger-start and --ledger-end (or defaults in --config).")
-    share_profile = args.share_profile or cfg_data.get("share_profile", "data/config.share")
+    share_profile = (
+        args.share_profile
+        or os.environ.get("XRPL_SHARE_PROFILE")
+        or cfg_data.get("share_profile", "data/config.share")
+    )
     share = args.share or cfg_data.get("share", "ripple-ubri-share")
     schema = args.schema or cfg_data.get("schema", "ripplex")
     table_amm = args.table_amm or cfg_data.get("table_amm", "fact_amm_swaps")
@@ -96,9 +147,10 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
     planned: list[tuple[str, list[str]]] = []
 
     if not args.skip_export:
+        _validate_share_profile(root / share_profile)
         planned.append(
             (
-                "empirical/scripts/pipeline_export_window.py",
+                "empirical/scripts/empirical_export_window.py",
                 [
                     "--pair",
                     pair,
@@ -127,7 +179,7 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
     if not args.skip_build_input:
         planned.append(
             (
-                "empirical/scripts/pipeline_build_model_input.py",
+                "empirical/scripts/empirical_build_model_input.py",
                 [
                     "--input-amm",
                     f"{exports_dir}/amm_swaps",
@@ -154,7 +206,7 @@ def _run_pipeline(root: Path, raw_args: list[str]) -> int:
             )
         planned.append(
             (
-                "empirical/scripts/research_compare_rolling.py",
+                "empirical/scripts/empirical_compare_rolling.py",
                 [
                     "--root",
                     exports_dir,
@@ -197,10 +249,13 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     if args.alias == "pipeline-run":
         return _run_pipeline(root, args.script_args)
-    if args.alias not in SCRIPT_MAP:
-        choices = sorted([*SCRIPT_MAP.keys(), "pipeline-run"])
+    canonical = LEGACY_ALIAS_MAP.get(args.alias, args.alias)
+    if canonical != args.alias:
+        print(f"[info] alias '{args.alias}' is legacy; prefer '{canonical}'.")
+    if canonical not in SCRIPT_MAP:
+        choices = sorted([*SCRIPT_MAP.keys(), *LEGACY_ALIAS_MAP.keys(), "pipeline-run"])
         raise SystemExit(f"Unknown alias: {args.alias}. Available: {', '.join(choices)}")
-    _run_script(root, SCRIPT_MAP[args.alias], args.script_args)
+    _run_script(root, SCRIPT_MAP[canonical], args.script_args)
     return 0
 
 

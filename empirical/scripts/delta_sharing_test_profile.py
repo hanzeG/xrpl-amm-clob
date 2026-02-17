@@ -5,13 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Test Delta Sharing profile access.")
-    p.add_argument("--profile", default="data/config.share", help="Path to .share profile")
+    p.add_argument(
+        "--profile",
+        default=os.environ.get("XRPL_SHARE_PROFILE", "data/config.share"),
+        help="Path to .share profile",
+    )
     p.add_argument(
         "--table",
         default="ripple-ubri-share.ripplex.offers_fact_tx",
@@ -44,6 +50,15 @@ def check_profile_expiry(profile_path: Path) -> None:
     print(f"[info] expirationTime: {exp.isoformat()} (UTC) -> {status}")
 
 
+def check_profile_permissions(profile_path: Path) -> None:
+    mode = stat.S_IMODE(profile_path.stat().st_mode)
+    if mode & (stat.S_IRGRP | stat.S_IROTH):
+        print(
+            f"[warn] {profile_path} is group/other-readable "
+            f"(mode {oct(mode)}). Recommended: chmod 600 {profile_path}"
+        )
+
+
 def main() -> int:
     args = parse_args()
     profile_path = Path(args.profile)
@@ -53,6 +68,7 @@ def main() -> int:
 
     print(f"[info] profile: {profile_path}")
     check_profile_expiry(profile_path)
+    check_profile_permissions(profile_path)
 
     table_url = f"{profile_path}#{args.table}"
     print(f"[info] testing table read: {table_url}")

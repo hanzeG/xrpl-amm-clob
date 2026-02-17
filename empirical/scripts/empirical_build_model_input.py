@@ -74,7 +74,7 @@ def default_output_paths(args: argparse.Namespace) -> tuple[str, str]:
 
 def main() -> None:
     args = parse_args()
-    spark = SparkSession.builder.appName("pipeline_build_model_input").getOrCreate()
+    spark = SparkSession.builder.appName("empirical_build_model_input").getOrCreate()
 
     output_dir, output_json = default_output_paths(args)
 
@@ -222,7 +222,7 @@ def main() -> None:
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "script": "pipeline_build_model_input.py",
+                "script": "empirical_build_model_input.py",
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
                 "pair": args.pair,
                 "window": {"ledger_start": args.ledger_start, "ledger_end": args.ledger_end},

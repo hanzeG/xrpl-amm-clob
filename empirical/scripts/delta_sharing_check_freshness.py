@@ -15,7 +15,7 @@ def main():
     ap.add_argument("--where", default="", help="optional SQL filter, e.g. close_time_date >= '2025-12-15'")
     args = ap.parse_args()
 
-    spark = SparkSession.builder.appName("check_delta_sharing_freshness").getOrCreate()
+    spark = SparkSession.builder.appName("delta_sharing_check_freshness").getOrCreate()
 
     df = spark.read.format("deltaSharing").load(args.table)
 

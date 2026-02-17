@@ -31,3 +31,5 @@ python apps/run_empirical.py pipeline-run -- \
 ## Notes
 - Empirical defaults are centralized in `configs/empirical/pipeline_run.default.json`.
 - Credentials are local-only via `data/config.share` (template: `data/config.share.example`).
+- You can override the profile path with `XRPL_SHARE_PROFILE=/absolute/path/to/config.share`.
+- Recommended local permission: `chmod 600 data/config.share`.
