@@ -150,20 +150,26 @@ def _execute_one_iteration(
             if q_lob_top is None or s.quality.rate > q_lob_top.rate:
                 q_lob_top = s.quality
 
-    # Try to synthesize an AMM slice anchored to LOB top; do NOT mix it into LOB tier
+    # Try to synthesize an AMM slice anchored to LOB top; do NOT mix it into LOB tier.
+    # Strict priority rule: only allow AMM anchoring when SPQ is strictly better than
+    # the current CLOB top quality. If SPQ == CLOB top, CLOB remains preferred.
     synth: Optional[Segment] = None
-    if q_lob_top is not None and amm_anchor:
+    amm_strictly_better = (
+        (q_lob_top is not None)
+        and (amm_anchor is not None)
+        and (amm_spq is not None)
+        and (amm_spq.rate > q_lob_top.rate)
+        and (not target_out.is_zero())
+    )
+    if amm_strictly_better:
         try:
             synth = amm_anchor(q_lob_top, target_out)
         except Exception:
             synth = None
-            
+
         # If AMM SPQ is strictly better than LOB top quality, we *prefer* an anchored slice.
-    # However, due to integer grid / fee rounding / cap, an anchored slice may be impossible
-    # to synthesise even when SPQ > LOB top. This is not a fatal error: we must fall back
-    # to LOB-only for this iteration (or AMM-only later if LOB exhausts), rather than abort.
-    if (q_lob_top is not None and amm_anchor and (amm_spq is not None)
-            and (amm_spq.rate > q_lob_top.rate) and (not target_out.is_zero())):
+        # However, due to integer grid / fee rounding / cap, an anchored slice may still be
+        # impossible. In that case we fall back to LOB-only for this iteration.
         if synth is None:
             trace.append({
                 "src": "AMM",
@@ -173,7 +179,6 @@ def _execute_one_iteration(
                 "amm_spq": amm_spq,
                 "target_out": target_out,
             })
-            # Proceed without AMM-first in this iteration; LOB tier will execute below.
 
     # AMM slices bundle for AMM-only shadow slicing
     amm_slices: List[Segment] = []

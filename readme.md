@@ -84,6 +84,13 @@ Model trajectory table (after AMM merge):
 The notebook prints the full three tables for the selected tx.
 Use them directly to compare real execution trajectory, model pre-merge AMM slices, and merged model trajectory.
 
+## BookStep Priority (Current)
+- Routing is processed by quality from best to worse.
+- If no CLOB exists at the current top quality, the step uses AMM-only synthetic liquidity for that level.
+- If CLOB exists, AMM is allowed to anchor first only when `AMM SPQ > CLOB top quality` (strictly better).
+- If `AMM SPQ == CLOB top quality` (or worse), CLOB is preferred first.
+- Within a level, matching stays on that level's liquidity (AMM synthetic and/or same-quality CLOB) and does not jump to worse quality until the current level is exhausted or target is met.
+
 ## Structure
 - `src/xrpl_router/`: routing core and math
 - `empirical/`: data export and comparison workflows
