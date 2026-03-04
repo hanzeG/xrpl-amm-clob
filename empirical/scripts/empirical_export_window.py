@@ -49,6 +49,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pair", default="rlusd_xrp", help="Pair key used in output path naming")
     p.add_argument("--output-dir", "--out-root", dest="output_dir", default=None, help="Output directory")
     p.add_argument("--with-amm-ledger-csv", action="store_true", help="Also export AMM ledger stats CSV")
+    p.add_argument(
+        "--sort-output",
+        action="store_true",
+        help="Sort rows before parquet write (slower). Default is unsorted for speed.",
+    )
+    p.add_argument(
+        "--with-row-counts",
+        action="store_true",
+        help="Print output row counts after write (slower due to extra scans).",
+    )
 
     p.add_argument("--skip-amm", action="store_true", help="Skip AMM swaps export")
     p.add_argument("--skip-clob", action="store_true", help="Skip CLOB legs export")
@@ -176,9 +186,13 @@ def main() -> None:
         )
 
         out_amm = os.path.join(out_root, "amm_swaps")
-        amm.orderBy(F.col("close_time_datetime").asc_nulls_last()).write.mode("overwrite").parquet(out_amm)
-        amm_rows = amm.count()
-        print(f"[ok] AMM rows={amm_rows} -> {out_amm}")
+        amm_to_write = amm.orderBy(F.col("close_time_datetime").asc_nulls_last()) if args.sort_output else amm
+        amm_to_write.write.mode("overwrite").parquet(out_amm)
+        if args.with_row_counts:
+            amm_rows = amm.count()
+            print(f"[ok] AMM rows={amm_rows} -> {out_amm}")
+        else:
+            print(f"[ok] AMM -> {out_amm}")
 
         if args.with_amm_ledger_csv:
             out_amm_csv = os.path.join(out_root, "amm_ledgers")
@@ -244,9 +258,13 @@ def main() -> None:
         )
 
         out_clob = os.path.join(out_root, "clob_legs")
-        clob.orderBy(F.col("close_time").asc_nulls_last()).write.mode("overwrite").parquet(out_clob)
-        clob_rows = clob.count()
-        print(f"[ok] CLOB rows={clob_rows} -> {out_clob}")
+        clob_to_write = clob.orderBy(F.col("close_time").asc_nulls_last()) if args.sort_output else clob
+        clob_to_write.write.mode("overwrite").parquet(out_clob)
+        if args.with_row_counts:
+            clob_rows = clob.count()
+            print(f"[ok] CLOB rows={clob_rows} -> {out_clob}")
+        else:
+            print(f"[ok] CLOB -> {out_clob}")
 
     # Fees
     if not args.skip_fees:
@@ -257,9 +275,13 @@ def main() -> None:
         fees = apply_date_filter(fees, "close_time_date", args.date_start, args.date_end)
         fees = apply_time_filter(fees, "close_time_datetime", args.time_start, args.time_end)
         out_fees = os.path.join(out_root, "amm_fees")
-        fees.orderBy(F.col("close_time_datetime").asc_nulls_last()).write.mode("overwrite").parquet(out_fees)
-        fee_rows = fees.count()
-        print(f"[ok] FEES rows={fee_rows} -> {out_fees}")
+        fees_to_write = fees.orderBy(F.col("close_time_datetime").asc_nulls_last()) if args.sort_output else fees
+        fees_to_write.write.mode("overwrite").parquet(out_fees)
+        if args.with_row_counts:
+            fee_rows = fees.count()
+            print(f"[ok] FEES rows={fee_rows} -> {out_fees}")
+        else:
+            print(f"[ok] FEES -> {out_fees}")
 
     spark.stop()
     manifest = {
